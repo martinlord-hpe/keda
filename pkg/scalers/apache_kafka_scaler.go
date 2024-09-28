@@ -57,6 +57,12 @@ type apacheKafkaMetadata struct {
 	OffsetResetPolicy      offsetResetPolicy `keda:"name=offsetResetPolicy,      order=triggerMetadata, enum=earliest;latest, default=latest"`
 	AllowIdleConsumers     bool              `keda:"name=allowIdleConsumers,     order=triggerMetadata, optional"`
 	ExcludePersistentLag   bool              `keda:"name=excludePersistentLag,   order=triggerMetadata, optional"`
+	// Scale on ratio of lag to residual lag instead of lagThreshold.  Residual lag is calculated as published messages/s * CommitInterval / 2
+	// Consumer group consuming a topic at the same rate as publisher will have a LagRatio of 1.0 on average and between 0.0 and 2.0.
+	// A consumer group that is consuming messages CommitInterval/2 after published would have on average a LafRatio of 2.0
+	// 3.0 would is a good starting value.
+	LagRatio       float64 `keda:"name=lagRatio,               order=triggerMetadata, optional"`
+	CommitInterval int64   `keda:"name=commitInterva           order=triggerMetadata, optional"`
 
 	// If an invalid offset is found, whether to scale to 1 (false - the default) so consumption can
 	// occur or scale to 0 (true). See discussion in https://github.com/kedacore/keda/issues/2612
@@ -104,6 +110,16 @@ func (a *apacheKafkaMetadata) Validate() error {
 		// no specific topics set, ignoring partitionLimitation setting
 		a.PartitionLimitation = nil
 	}
+	if a.LagRatio != 0 && a.LagRatio < 0.8 {
+		return fmt.Errorf("lagRatio must be a float greater than 0.8")
+	}
+	if a.CommitInterval <= 0 {
+		return fmt.Errorf("commitInterval must be a positive number")
+	}
+	if a.LagRatio != 0.0 && a.CommitInterval == 0 {
+		return fmt.Errorf("commitInterval is required with lagRatio")
+	}
+
 	if a.enableTLS() && ((a.Cert == "") != (a.Key == "")) {
 		return fmt.Errorf("can't set only one of cert or key when using TLS")
 	}
