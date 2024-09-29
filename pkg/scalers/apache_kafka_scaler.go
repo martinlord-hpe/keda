@@ -113,7 +113,7 @@ func (a *apacheKafkaMetadata) Validate() error {
 	if a.LagRatio != 0 && a.LagRatio < 0.8 {
 		return fmt.Errorf("lagRatio must be a float greater than 0.8")
 	}
-	if a.CommitInterval <= 0 {
+	if a.CommitInterval < 0 {
 		return fmt.Errorf("commitInterval must be a positive number")
 	}
 	if a.LagRatio != 0.0 && a.CommitInterval == 0 {
