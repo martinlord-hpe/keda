@@ -40,11 +40,12 @@ import (
 )
 
 type apacheKafkaScaler struct {
-	metricType      v2.MetricTargetType
-	metadata        apacheKafkaMetadata
-	client          *kafka.Client
-	logger          logr.Logger
-	previousOffsets map[string]map[int]int64
+	metricType          v2.MetricTargetType
+	metadata            apacheKafkaMetadata
+	client              *kafka.Client
+	logger              logr.Logger
+	previousOffsets     map[string]map[int]int64
+	previousLastOffsets map[string]map[int]int64
 }
 
 type apacheKafkaMetadata struct {
@@ -62,7 +63,7 @@ type apacheKafkaMetadata struct {
 	// A consumer group that is consuming messages CommitInterval/2 after published would have on average a LafRatio of 2.0
 	// 3.0 would is a good starting value.
 	LagRatio       float64 `keda:"name=lagRatio,               order=triggerMetadata, optional"`
-	CommitInterval int64   `keda:"name=commitInterva           order=triggerMetadata, optional"`
+	CommitInterval int64   `keda:"name=commitInterval,         order=triggerMetadata, optional"`
 
 	// If an invalid offset is found, whether to scale to 1 (false - the default) so consumption can
 	// occur or scale to 0 (true). See discussion in https://github.com/kedacore/keda/issues/2612
@@ -94,6 +95,8 @@ func (a *apacheKafkaMetadata) enableTLS() bool {
 }
 
 func (a *apacheKafkaMetadata) Validate() error {
+	// TODO: temporary
+	_ = fmt.Errorf("XXXXXXXX -> v 0.1")
 	if a.LagThreshold <= 0 {
 		return fmt.Errorf("lagThreshold must be a positive number")
 	}
@@ -110,7 +113,7 @@ func (a *apacheKafkaMetadata) Validate() error {
 		// no specific topics set, ignoring partitionLimitation setting
 		a.PartitionLimitation = nil
 	}
-	if a.LagRatio != 0 && a.LagRatio < 0.8 {
+	if a.LagRatio != 0 && a.LagRatio < 1.0 {
 		return fmt.Errorf("lagRatio must be a float greater than 0.8")
 	}
 	if a.CommitInterval < 0 {
@@ -162,17 +165,20 @@ func NewApacheKafkaScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 	}
 
 	previousOffsets := make(map[string]map[int]int64)
+	previousLastOffsets := make(map[string]map[int]int64)
 
 	return &apacheKafkaScaler{
-		client:          client,
-		metricType:      metricType,
-		metadata:        kafkaMetadata,
-		logger:          logger,
-		previousOffsets: previousOffsets,
+		client:              client,
+		metricType:          metricType,
+		metadata:            kafkaMetadata,
+		logger:              logger,
+		previousOffsets:     previousOffsets,
+		previousLastOffsets: previousLastOffsets,
 	}, nil
 }
 
 func parseApacheKafkaAuthParams(config *scalersconfig.ScalerConfig, meta *apacheKafkaMetadata) error {
+
 	if config.TriggerMetadata["sasl"] != "" && config.AuthParams["sasl"] != "" {
 		return errors.New("unable to set `sasl` in both ScaledObject and TriggerAuthentication together")
 	}
