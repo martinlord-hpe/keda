@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/segmentio/kafka-go"
@@ -46,6 +47,7 @@ type apacheKafkaScaler struct {
 	logger              logr.Logger
 	previousOffsets     map[string]map[int]int64
 	previousLastOffsets map[string]map[int]int64
+	lastOffetsTime      time.Time
 }
 
 type apacheKafkaMetadata struct {
@@ -95,8 +97,6 @@ func (a *apacheKafkaMetadata) enableTLS() bool {
 }
 
 func (a *apacheKafkaMetadata) Validate() error {
-	// TODO: temporary
-	_ = fmt.Errorf("XXXXXXXX -> v 0.1")
 	if a.LagThreshold <= 0 {
 		return fmt.Errorf("lagThreshold must be a positive number")
 	}
@@ -178,7 +178,6 @@ func NewApacheKafkaScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 }
 
 func parseApacheKafkaAuthParams(config *scalersconfig.ScalerConfig, meta *apacheKafkaMetadata) error {
-
 	if config.TriggerMetadata["sasl"] != "" && config.AuthParams["sasl"] != "" {
 		return errors.New("unable to set `sasl` in both ScaledObject and TriggerAuthentication together")
 	}
@@ -344,6 +343,38 @@ func (s *apacheKafkaScaler) getConsumerOffsets(ctx context.Context, topicPartiti
 	return consumerOffset, nil
 }
 
+// getProducerOffsets returns the latest offsets for the given topic partitions
+func (s *apacheKafkaScaler) getProducerOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, error) {
+	// Step 1: build one OffsetRequest
+	offsetRequest := make(map[string][]kafka.OffsetRequest)
+
+	for topic, partitions := range topicPartitions {
+		for _, partitionID := range partitions {
+			offsetRequest[topic] = append(offsetRequest[topic], kafka.FirstOffsetOf(partitionID), kafka.LastOffsetOf(partitionID))
+		}
+	}
+
+	// Step 2: send request
+	res, err := s.client.ListOffsets(ctx, &kafka.ListOffsetsRequest{
+		Addr:   s.client.Addr,
+		Topics: offsetRequest,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: parse response and return
+	producerOffsets := make(map[string]map[int]int64)
+	for topic, partitionOffset := range res.Topics {
+		producerOffsets[topic] = make(map[int]int64)
+		for _, partition := range partitionOffset {
+			producerOffsets[topic][partition.Partition] = partition.LastOffset
+		}
+	}
+
+	return producerOffsets, nil
+}
+
 /*
 getLagForPartition returns (lag, lagWithPersistent, error)
 
@@ -499,6 +530,7 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 	s.logger.V(4).Info(fmt.Sprintf("Kafka scaler: Topic partitions %v", topicPartitions))
 
 	consumerOffsets, producerOffsets, err := s.getConsumerAndProducerOffsets(ctx, topicPartitions)
+	s.lastOffetsTime = time.Now()
 	s.logger.V(4).Info(fmt.Sprintf("Kafka scaler: Consumer offsets %v, producer offsets %v", consumerOffsets, producerOffsets))
 	if err != nil {
 		return 0, 0, err
@@ -540,36 +572,4 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 		}
 	}
 	return totalLag, totalLagWithPersistent, nil
-}
-
-// getProducerOffsets returns the latest offsets for the given topic partitions
-func (s *apacheKafkaScaler) getProducerOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, error) {
-	// Step 1: build one OffsetRequest
-	offsetRequest := make(map[string][]kafka.OffsetRequest)
-
-	for topic, partitions := range topicPartitions {
-		for _, partitionID := range partitions {
-			offsetRequest[topic] = append(offsetRequest[topic], kafka.FirstOffsetOf(partitionID), kafka.LastOffsetOf(partitionID))
-		}
-	}
-
-	// Step 2: send request
-	res, err := s.client.ListOffsets(ctx, &kafka.ListOffsetsRequest{
-		Addr:   s.client.Addr,
-		Topics: offsetRequest,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Step 3: parse response and return
-	producerOffsets := make(map[string]map[int]int64)
-	for topic, partitionOffset := range res.Topics {
-		producerOffsets[topic] = make(map[int]int64)
-		for _, partition := range partitionOffset {
-			producerOffsets[topic][partition.Partition] = partition.LastOffset
-		}
-	}
-
-	return producerOffsets, nil
 }
