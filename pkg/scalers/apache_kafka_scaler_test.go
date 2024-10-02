@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/go-logr/logr"
 
@@ -365,7 +364,7 @@ func TestApacheKafkaGetMetricSpecForScaling(t *testing.T) {
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
-		mockKafkaScaler := apacheKafkaScaler{"", meta, nil, logr.Discard(), make(map[string]map[int]int64), make(map[string]map[int]int64), time.Now()}
+		mockKafkaScaler := apacheKafkaScaler{"", meta, nil, logr.Discard(), make(map[string]map[int]int64), make(map[string]map[int]int64), 0}
 
 		metricSpec := mockKafkaScaler.GetMetricSpecForScaling(context.Background())
 		metricName := metricSpec[0].External.Metric.Name
