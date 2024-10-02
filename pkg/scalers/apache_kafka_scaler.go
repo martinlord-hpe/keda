@@ -47,7 +47,7 @@ type apacheKafkaScaler struct {
 	logger              logr.Logger
 	previousOffsets     map[string]map[int]int64
 	previousLastOffsets map[string]map[int]int64
-	lastOffetsTime      time.Time
+	lastOffetsTime      int64
 }
 
 type apacheKafkaMetadata struct {
@@ -62,7 +62,7 @@ type apacheKafkaMetadata struct {
 	ExcludePersistentLag   bool              `keda:"name=excludePersistentLag,   order=triggerMetadata, optional"`
 	// Scale on ratio of lag to residual lag instead of lagThreshold.  Residual lag is calculated as published messages/s * CommitInterval / 2
 	// Consumer group consuming a topic at the same rate as publisher will have a LagRatio of 1.0 on average and between 0.0 and 2.0.
-	// A consumer group that is consuming messages CommitInterval/2 after published would have on average a LafRatio of 2.0
+	// A consumer group that is consuming messages 'CommitInterval' after published would have on average a LafRatio of 2.0
 	// 3.0 would is a good starting value.
 	LagRatio       float64 `keda:"name=lagRatio,               order=triggerMetadata, optional"`
 	CommitInterval int64   `keda:"name=commitInterval,         order=triggerMetadata, optional"`
@@ -144,6 +144,7 @@ func (a *apacheKafkaMetadata) Validate() error {
 
 const (
 	KafkaSASLTypeMskIam = "aws_msk_iam"
+	nominalLagRatio     = 0.5
 )
 
 // NewApacheKafkaScaler creates a new apacheKafkaScaler
@@ -407,6 +408,7 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 		return 0, 0, fmt.Errorf("error finding partition offset for topic %s", topic)
 	}
 	producerOffset := producerOffsets[topic][partitionID]
+
 	if consumerOffset == invalidOffset && s.metadata.OffsetResetPolicy == earliest {
 		if s.metadata.ScaleToZeroOnInvalidOffset {
 			return 0, 0, nil
@@ -439,6 +441,86 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 	s.logger.V(4).Info(fmt.Sprintf("Producer offset for topic %s in group %s and partition %d is %d", topic, s.metadata.Group, partitionID, producerOffset))
 
 	return producerOffset - consumerOffset, producerOffset - consumerOffset, nil
+}
+
+/*
+getLagRatioForPartition returns (lagRatio, lagRatioWithPersistent, error)
+
+When excludePersistentLag is set to `false` (default), lag will always be equal to lagWithPersistent
+When excludePersistentLag is set to `true`, if partition is deemed to have persistent lag, lagRatio
+will be set to minLagRatio and lagRatioWithPersistent will be regular calculation
+These return values will allow proper scaling from 0 -> 1 replicas by the IsActive func.
+*/
+func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (float64, float64, error) {
+	if len(consumerOffsets) == 0 {
+		return 0, 0, fmt.Errorf("consumerOffsets is empty")
+	}
+	if len(producerOffsets) == 0 {
+		return 0, 0, fmt.Errorf("producerOffsets is empty")
+	}
+
+	consumerOffset := consumerOffsets[topic][partitionID]
+	if consumerOffset == invalidOffset {
+		if s.metadata.ScaleToZeroOnInvalidOffset {
+			// TODO - do not use initially
+		}
+		msg := fmt.Sprintf(
+			"invalid offset found for topic %s in group %s and partition %d, probably no offset is committed yet. Returning with lag of %f",
+			topic, s.metadata.Group, partitionID, 0.0)
+		s.logger.V(1).Info(msg)
+		return 0, 0, nil
+	}
+
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	if _, found := producerOffsets[topic]; !found {
+		return 0, 0, fmt.Errorf("error finding partition producer offset for topic %s", topic)
+	}
+	if _, found := s.previousLastOffsets[topic]; !found {
+		// last offset is producer offset
+		s.previousLastOffsets[topic][partitionID] = producerOffsets[topic][partitionID]
+		s.lastOffetsTime = now
+		// TODO normal on first run
+		return 0, 0, fmt.Errorf("error finding partition producer previous offset for topic %s, should happen only on first run", topic)
+	}
+	producerOffset := producerOffsets[topic][partitionID]
+	previousProducerOffset := s.previousLastOffsets[topic][partitionID]
+	s.previousLastOffsets[topic][partitionID] = producerOffset
+	// number of messages written to the partition since last run
+	messages := producerOffset - previousProducerOffset
+	if messages < 0 {
+		return 0, 0, fmt.Errorf("unexpected error calculating messages for offset of topic %s", topic)
+	}
+	// period of time during which those messages were published in ms
+	period := now - s.lastOffetsTime
+	s.lastOffetsTime = now
+	// in messages per milliseconds
+	writeThroughput := float64(messages / period)
+
+	// residualLag is the lag we are expecting to see even if the consumerGroup reads the messages on a
+	// timely basis.  The higher the partition throughput is and the highger the commit interval is
+	// (30,000ms defautt for Kafka Streams), the higher the residualLag.    This is why scaling on
+	// topic partitions fixed lag value is not possible for data pipelines, the absolute lag value
+	// will increase with write throughout. The premise of this scaler is that lagRatio will stay constant
+	// at an average of 0.5 as long as the consumerGroup will be able to consume the messages and lagRatio
+	// will start to go up when consumerGroup will fall behind.
+	//
+	// On well balanced topics with some throughput in the tens of messages per second, lag will measure
+	// slightly above 0.5. Depending on the luck of the draw, it could come anywhere between 0.0 and slightly
+	// above 1.0 depending when we read the offsets in relation to when consumer offsets are updated.   producer
+	// offsets are updated as the messages are written
+	residualLag := writeThroughput * float64(s.metadata.CommitInterval) / 2
+	ratio := float64(consumerOffset-producerOffset) / residualLag
+
+	// This code block tries to prevent KEDA Kafka trigger from scaling the scale target based on erroneous events
+	if s.metadata.ExcludePersistentLag {
+		// TODO: implement this
+	}
+
+	s.logger.V(4).Info(fmt.Sprintf("Consumer offset for topic %s in group %s and partition %d is %d", topic, s.metadata.Group, partitionID, consumerOffset))
+	s.logger.V(4).Info(fmt.Sprintf("Producer offset for topic %s in group %s and partition %d is %d", topic, s.metadata.Group, partitionID, producerOffset))
+	s.logger.V(4).Info(fmt.Sprintf("Lag ratio for topic %s in group %s and partition %d is %f", topic, s.metadata.Group, partitionID, ratio))
+
+	return ratio, ratio, nil
 }
 
 // Close closes the kafka client
@@ -510,7 +592,16 @@ func (s *apacheKafkaScaler) getConsumerAndProducerOffsets(ctx context.Context, t
 
 // GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
 func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+	// TODO - for now when LagRatio is defined, it will just compute the lag ratio metrics and log, regular code path follows.
+	if s.metadata.LagRatio != 0 {
+		_, _, err2 := s.getTotalLagRatio(ctx)
+		if err2 != nil {
+			_ = fmt.Errorf("error calculating lagRatio in GetMetricsAndActivity %s", err2)
+		}
+
+	}
 	totalLag, totalLagWithPersistent, err := s.getTotalLag(ctx)
+
 	if err != nil {
 		return []external_metrics.ExternalMetricValue{}, false, err
 	}
@@ -530,7 +621,6 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 	s.logger.V(4).Info(fmt.Sprintf("Kafka scaler: Topic partitions %v", topicPartitions))
 
 	consumerOffsets, producerOffsets, err := s.getConsumerAndProducerOffsets(ctx, topicPartitions)
-	s.lastOffetsTime = time.Now()
 	s.logger.V(4).Info(fmt.Sprintf("Kafka scaler: Consumer offsets %v, producer offsets %v", consumerOffsets, producerOffsets))
 	if err != nil {
 		return 0, 0, err
@@ -572,4 +662,59 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 		}
 	}
 	return totalLag, totalLagWithPersistent, nil
+}
+
+func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, float64, error) {
+
+	topicPartitions, err := s.getTopicPartitions(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	s.logger.V(4).Info(fmt.Sprintf("Kafka lag ratio scaler: Topic partitions %v", topicPartitions))
+
+	consumerOffsets, producerOffsets, err := s.getConsumerAndProducerOffsets(ctx, topicPartitions)
+	s.logger.V(4).Info(fmt.Sprintf("Kafka scaler: Consumer offsets %v, producer offsets %v", consumerOffsets, producerOffsets))
+	if err != nil {
+		return 0, 0, err
+	}
+
+	averageLagRatio := float64(0)
+	averageLagRatioWithPersistent := float64(0)
+	totalTopicPartitions := int64(0)
+	partitionsWithLag := int64(0)
+	largestRatio := float64(0)
+	topicWithLargestRatio := "no topic"
+
+	for topic, partitionsOffsets := range producerOffsets {
+		for partition := range partitionsOffsets {
+			lagRatio, lagRatioWithPersistent, err := s.getLagRatioForPartition(topic, partition, consumerOffsets, producerOffsets)
+			if err != nil {
+				return 0, 0, err
+			}
+
+			averageLagRatio += lagRatio
+			averageLagRatioWithPersistent += lagRatioWithPersistent
+			// TODO: review this
+			if lagRatio > 0 {
+				partitionsWithLag++
+			}
+		}
+		totalTopicPartitions = (int64)(len(partitionsOffsets))
+		averageLagRatio = averageLagRatio / float64(totalTopicPartitions)
+		averageLagRatioWithPersistent /= float64(partitionsWithLag)
+
+		s.logger.V(1).Info(fmt.Sprintf("Kafka ratio scaler: topic: %s. logRatio %f, threshold %v", topic, averageLagRatio, s.metadata.LagRatio))
+		// largest lagRatio is considered for scaling, different that the total for the treshold scaler
+		if averageLagRatio > largestRatio {
+			largestRatio = averageLagRatio
+			topicWithLargestRatio = topic
+		}
+	}
+	s.logger.V(1).Info(fmt.Sprintf("Kafka ratio scaler: largest ratio for consumergroup: %s, topic: %s, logRatio %f, threshold %v", s.metadata.Group, topicWithLargestRatio, averageLagRatio, s.metadata.LagRatio))
+
+	if !s.metadata.AllowIdleConsumers || s.metadata.LimitToPartitionsWithLag {
+		// TODO
+	}
+	return averageLagRatio, averageLagRatioWithPersistent, nil
+
 }
