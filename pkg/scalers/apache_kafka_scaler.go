@@ -465,32 +465,41 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 			// TODO - do not use initially
 		}
 		msg := fmt.Sprintf(
-			"invalid offset found for topic %s in group %s and partition %d, probably no offset is committed yet. Returning with lag of %f",
+			"invalid committed offset found for topic %s in group %s and partition %d, probably no offset is committed yet. Returning with lag of %f",
 			topic, s.metadata.Group, partitionID, 0.0)
 		s.logger.V(1).Info(msg)
 		return 0, 0, nil
 	}
 
-	now := time.Now().UnixNano() / int64(time.Millisecond)
 	if _, found := producerOffsets[topic]; !found {
 		return 0, 0, fmt.Errorf("error finding partition producer offset for topic %s", topic)
 	}
-	if _, found := s.previousLastOffsets[topic]; !found {
-		// last offset is producer offset
-		s.previousLastOffsets[topic][partitionID] = producerOffsets[topic][partitionID]
-		s.lastOffetsTime = now
-		// TODO normal on first run
-		return 0, 0, fmt.Errorf("error finding partition producer previous offset for topic %s, should happen only on first run", topic)
-	}
 	producerOffset := producerOffsets[topic][partitionID]
-	previousProducerOffset := s.previousLastOffsets[topic][partitionID]
-	s.previousLastOffsets[topic][partitionID] = producerOffset
+	previousProducerOffset, found := s.previousLastOffsets[topic][partitionID]
+	switch {
+	case !found:
+		// No record of previous last offset, so store current consumer offset
+		if _, topicFound := s.previousLastOffsets[topic]; !topicFound {
+			s.previousLastOffsets[topic] = map[int]int64{partitionID: producerOffset}
+		} else {
+			s.previousLastOffsets[topic][partitionID] = producerOffset
+		}
+		// LagRatio scaler needs a previous last offset value.
+		return 0.0, 0.0, nil
+	case previousProducerOffset == producerOffset:
+		// no writes on partition since last metrics check
+		return 0.0, 0.0, nil
+	default:
+		s.previousLastOffsets[topic][partitionID] = producerOffset
+	}
+
 	// number of messages written to the partition since last run
 	messages := producerOffset - previousProducerOffset
 	if messages < 0 {
 		return 0, 0, fmt.Errorf("unexpected error calculating messages for offset of topic %s", topic)
 	}
 	// period of time during which those messages were published in ms
+	now := time.Now().UnixNano() / int64(time.Millisecond)
 	period := now - s.lastOffetsTime
 	s.lastOffetsTime = now
 	// in messages per milliseconds
@@ -508,7 +517,7 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 	// slightly above 0.5. Depending on the luck of the draw, it could come anywhere between 0.0 and slightly
 	// above 1.0 depending when we read the offsets in relation to when consumer offsets are updated.   producer
 	// offsets are updated as the messages are written
-	residualLag := writeThroughput * float64(s.metadata.CommitInterval) / 2
+	residualLag := writeThroughput * float64(s.metadata.CommitInterval) / 2.0
 	ratio := float64(consumerOffset-producerOffset) / residualLag
 
 	// This code block tries to prevent KEDA Kafka trigger from scaling the scale target based on erroneous events
