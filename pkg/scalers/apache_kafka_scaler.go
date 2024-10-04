@@ -593,15 +593,16 @@ func (s *apacheKafkaScaler) getConsumerAndProducerOffsets(ctx context.Context, t
 // GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
 func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	// TODO - for now when LagRatio is defined, it will just compute the lag ratio metrics and log, regular code path follows.
-	if s.metadata.LagRatio != 0 {
-		_, _, err2 := s.getTotalLagRatio(ctx)
-		if err2 != nil {
-			_ = fmt.Errorf("error calculating lagRatio in GetMetricsAndActivity %s", err2)
-		}
-
+	if s.metadata.LagRatio == 0 {
+		s.metadata.LagRatio = 2.5
+		s.metadata.CommitInterval = 30000
 	}
-	totalLag, totalLagWithPersistent, err := s.getTotalLag(ctx)
+	_, _, err2 := s.getTotalLagRatio(ctx)
+	if err2 != nil {
+		_ = fmt.Errorf("error calculating lagRatio in GetMetricsAndActivity %s", err2)
+	}
 
+	totalLag, totalLagWithPersistent, err := s.getTotalLag(ctx)
 	if err != nil {
 		return []external_metrics.ExternalMetricValue{}, false, err
 	}
