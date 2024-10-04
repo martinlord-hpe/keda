@@ -476,6 +476,9 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 	}
 	producerOffset := producerOffsets[topic][partitionID]
 	previousProducerOffset, found := s.previousLastOffsets[topic][partitionID]
+	previousLastOffsettime := s.lastOffetsTime
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	s.lastOffetsTime = now
 	switch {
 	case !found:
 		// No record of previous last offset, so store current consumer offset
@@ -498,13 +501,13 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 	if messages < 0 {
 		return 0, 0, fmt.Errorf("unexpected error calculating messages for offset of topic %s", topic)
 	}
-	// period of time during which those messages were published in ms
-	now := time.Now().UnixNano() / int64(time.Millisecond)
-	period := now - s.lastOffetsTime
-	s.lastOffetsTime = now
-	// in messages per milliseconds
-	writeThroughput := float64(messages / period)
 
+	// in messages per milliseconds
+	period := now - previousLastOffsettime
+	if period <= 0 {
+		return 0, 0, fmt.Errorf("unexpected error calculating period for offset of topic %s", topic)
+	}
+	writeThroughput := float64(messages / period)
 	// residualLag is the lag we are expecting to see even if the consumerGroup reads the messages on a
 	// timely basis.  The higher the partition throughput is and the highger the commit interval is
 	// (30,000ms defautt for Kafka Streams), the higher the residualLag.    This is why scaling on
