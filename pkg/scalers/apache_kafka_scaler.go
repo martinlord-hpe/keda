@@ -144,7 +144,6 @@ func (a *apacheKafkaMetadata) Validate() error {
 
 const (
 	KafkaSASLTypeMskIam = "aws_msk_iam"
-	nominalLagRatio     = 0.5
 )
 
 // NewApacheKafkaScaler creates a new apacheKafkaScaler
@@ -446,6 +445,8 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 /*
 getLagRatioForPartition returns (lagRatio, lagRatioWithPersistent, error)
 
+# TODO
+
 When excludePersistentLag is set to `false` (default), lag will always be equal to lagWithPersistent
 When excludePersistentLag is set to `true`, if partition is deemed to have persistent lag, lagRatio
 will be set to minLagRatio and lagRatioWithPersistent will be regular calculation
@@ -464,7 +465,6 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 		if s.metadata.ScaleToZeroOnInvalidOffset {
 			// TODO - do not use initially
 		}
-		// TODO reformat
 		msg := fmt.Sprintf(
 			"Kafka lagRatio, invalid committed offset found for topic %s in group %s and partition %d, probably no offset is committed yet. Returning with lag ratio of %.6f",
 			topic, s.metadata.Group, partitionID, 0.0)
@@ -552,20 +552,39 @@ func (s *apacheKafkaScaler) Close(context.Context) error {
 
 func (s *apacheKafkaScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	var metricName string
-	if s.metadata.Topic != nil && len(s.metadata.Topic) > 0 {
-		metricName = fmt.Sprintf("kafka-%s", strings.Join(s.metadata.Topic, ","))
-	} else {
-		metricName = fmt.Sprintf("kafka-%s-topics", s.metadata.Group)
-	}
 
-	externalMetric := &v2.ExternalMetricSource{
-		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
-		},
-		Target: GetMetricTarget(s.metricType, s.metadata.LagThreshold),
+	if s.metadata.LagRatio == 0 {
+		if s.metadata.Topic != nil && len(s.metadata.Topic) > 0 {
+			metricName = fmt.Sprintf("kafka-%s", strings.Join(s.metadata.Topic, ","))
+		} else {
+			metricName = fmt.Sprintf("kafka-%s-topics", s.metadata.Group)
+		}
+
+		externalMetric := &v2.ExternalMetricSource{
+			Metric: v2.MetricIdentifier{
+				Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
+			},
+			Target: GetMetricTarget(s.metricType, s.metadata.LagThreshold),
+		}
+		metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
+		return []v2.MetricSpec{metricSpec}
+	} else {
+		if s.metadata.Topic != nil && len(s.metadata.Topic) > 0 {
+			metricName = fmt.Sprintf("kafka-lagratio-%s-%s", s.metadata.Group, strings.Join(s.metadata.Topic, ","))
+		} else {
+			metricName = fmt.Sprintf("kafka-lagratio-%s-topics", s.metadata.Group)
+		}
+
+		externalMetric := &v2.ExternalMetricSource{
+			Metric: v2.MetricIdentifier{
+				Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
+			},
+			// use float internally but external metric is and int
+			Target: GetMetricTargetMili(s.metricType, s.metadata.LagRatio),
+		}
+		metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
+		return []v2.MetricSpec{metricSpec}
 	}
-	metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
-	return []v2.MetricSpec{metricSpec}
 }
 
 type apacheKafkaConsumerOffsetResult struct {
@@ -608,22 +627,23 @@ func (s *apacheKafkaScaler) getConsumerAndProducerOffsets(ctx context.Context, t
 // GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
 func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	// TODO - Temporary test codef, it will just compute the lag ratio metrics and log as wll
-	if s.metadata.LagRatio == 0 {
-		s.metadata.LagRatio = 2.5
-		s.metadata.CommitInterval = 30000
-	}
-	_, _, err2 := s.getTotalLagRatio(ctx)
-	if err2 != nil {
-		_ = fmt.Errorf("lagRatio, error calculating lagRatio in GetMetricsAndActivity %s", err2)
-	}
+	if s.metadata.LagRatio != 0 {
 
-	totalLag, totalLagWithPersistent, err := s.getTotalLag(ctx)
-	if err != nil {
-		return []external_metrics.ExternalMetricValue{}, false, err
-	}
-	metric := GenerateMetricInMili(metricName, float64(totalLag))
+		toplLagRatio, _, err := s.getTotalLagRatio(ctx)
+		if err != nil {
+			return []external_metrics.ExternalMetricValue{}, false, err
+		}
+		metric := GenerateMetricInMili(metricName, toplLagRatio)
+		return []external_metrics.ExternalMetricValue{metric}, true, nil
 
-	return []external_metrics.ExternalMetricValue{metric}, totalLagWithPersistent > s.metadata.ActivationLagThreshold, nil
+	} else {
+		totalLag, totalLagWithPersistent, err := s.getTotalLag(ctx)
+		if err != nil {
+			return []external_metrics.ExternalMetricValue{}, false, err
+		}
+		metric := GenerateMetricInMili(metricName, float64(totalLag))
+		return []external_metrics.ExternalMetricValue{metric}, totalLagWithPersistent > s.metadata.ActivationLagThreshold, nil
+	}
 }
 
 // getTotalLag returns totalLag, totalLagWithPersistent, error
