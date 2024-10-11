@@ -113,8 +113,8 @@ func (a *apacheKafkaMetadata) Validate() error {
 		// no specific topics set, ignoring partitionLimitation setting
 		a.PartitionLimitation = nil
 	}
-	if a.LagRatio != 0 && a.LagRatio < 1.0 {
-		return fmt.Errorf("lagRatio must be a float greater than 0.8")
+	if a.LagRatio != 0.0 && a.LagRatio < 0.5 {
+		return fmt.Errorf("lagRatio must be a float greater than 0.5")
 	}
 	if a.CommitInterval < 0 {
 		return fmt.Errorf("commitInterval must be a positive number")
@@ -553,22 +553,7 @@ func (s *apacheKafkaScaler) Close(context.Context) error {
 func (s *apacheKafkaScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	var metricName string
 
-	if s.metadata.LagRatio == 0 {
-		if s.metadata.Topic != nil && len(s.metadata.Topic) > 0 {
-			metricName = fmt.Sprintf("kafka-%s", strings.Join(s.metadata.Topic, ","))
-		} else {
-			metricName = fmt.Sprintf("kafka-%s-topics", s.metadata.Group)
-		}
-
-		externalMetric := &v2.ExternalMetricSource{
-			Metric: v2.MetricIdentifier{
-				Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
-			},
-			Target: GetMetricTarget(s.metricType, s.metadata.LagThreshold),
-		}
-		metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
-		return []v2.MetricSpec{metricSpec}
-	} else {
+	if s.metadata.LagRatio != 0.0 {
 		if s.metadata.Topic != nil && len(s.metadata.Topic) > 0 {
 			metricName = fmt.Sprintf("kafka-lagratio-%s-%s", s.metadata.Group, strings.Join(s.metadata.Topic, ","))
 		} else {
@@ -583,6 +568,24 @@ func (s *apacheKafkaScaler) GetMetricSpecForScaling(context.Context) []v2.Metric
 			Target: GetMetricTargetMili(s.metricType, s.metadata.LagRatio),
 		}
 		metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
+		s.logger.V(0).Info(fmt.Sprintf("Kafka lag Ratio metric name: %s", metricName))
+		return []v2.MetricSpec{metricSpec}
+
+	} else {
+		if s.metadata.Topic != nil && len(s.metadata.Topic) > 0 {
+			metricName = fmt.Sprintf("kafka-%s", strings.Join(s.metadata.Topic, ","))
+		} else {
+			metricName = fmt.Sprintf("kafka-%s-topics", s.metadata.Group)
+		}
+
+		externalMetric := &v2.ExternalMetricSource{
+			Metric: v2.MetricIdentifier{
+				Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
+			},
+			Target: GetMetricTarget(s.metricType, s.metadata.LagThreshold),
+		}
+		metricSpec := v2.MetricSpec{External: externalMetric, Type: kafkaMetricType}
+		s.logger.V(1).Info(fmt.Sprintf("Kafka lag Threshold metric name: %s", metricName))
 		return []v2.MetricSpec{metricSpec}
 	}
 }
@@ -627,8 +630,7 @@ func (s *apacheKafkaScaler) getConsumerAndProducerOffsets(ctx context.Context, t
 // GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
 func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	// TODO - Temporary test codef, it will just compute the lag ratio metrics and log as wll
-	if s.metadata.LagRatio != 0 {
-
+	if s.metadata.LagRatio != 0.0 {
 		toplLagRatio, _, err := s.getTotalLagRatio(ctx)
 		if err != nil {
 			return []external_metrics.ExternalMetricValue{}, false, err
