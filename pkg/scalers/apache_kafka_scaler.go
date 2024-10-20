@@ -48,6 +48,8 @@ type apacheKafkaScaler struct {
 	previousOffsets     map[string]map[int]int64
 	previousLastOffsets map[string]map[int]int64
 	lastOffetsTime      int64
+	LastRatioMetric     float64
+	thresholdCount      int64
 }
 
 type apacheKafkaMetadata struct {
@@ -64,8 +66,11 @@ type apacheKafkaMetadata struct {
 	// Consumer group consuming a topic at the same rate as publisher will have a LagRatio of 1.0 on average and between 0.0 and 2.0.
 	// A consumer group that is consuming messages 'CommitInterval' after published would have on average a LafRatio of 2.0
 	// 3.0 would is a good starting value.
-	LagRatio       float64 `keda:"name=lagRatio,               order=triggerMetadata, optional"`
-	CommitInterval int64   `keda:"name=commitInterval,         order=triggerMetadata, optional"`
+	LagRatio                  float64 `keda:"name=lagRatio,                  order=triggerMetadata, optional"`
+	CommitInterval            int64   `keda:"name=commitInterval,            order=triggerMetadata, optional"`
+	RatioMeasurementMinPeriod int64   `keda:"name=ratioMeasurementMinPeriod, order=triggerMetadata, default=60"`
+	MinPartitionWriteThrouput float64 `keda:"name=minPartitionWriteThrouput, order=triggerMetadata, default=0.5"`
+	MeasurementsForScale      int64   `keda:"name=measurementsForScale,      order=triggerMetadata, default=3"`
 
 	// If an invalid offset is found, whether to scale to 1 (false - the default) so consumption can
 	// occur or scale to 0 (true). See discussion in https://github.com/kedacore/keda/issues/2612
@@ -113,8 +118,8 @@ func (a *apacheKafkaMetadata) Validate() error {
 		// no specific topics set, ignoring partitionLimitation setting
 		a.PartitionLimitation = nil
 	}
-	if a.LagRatio != 0.0 && a.LagRatio < 0.5 {
-		return fmt.Errorf("lagRatio must be a float greater than 0.5")
+	if a.LagRatio != 0.0 && a.LagRatio < 1.0 {
+		return fmt.Errorf("lagRatio must be a float greater than 1.0")
 	}
 	if a.CommitInterval < 0 {
 		return fmt.Errorf("commitInterval must be a positive number")
@@ -122,7 +127,9 @@ func (a *apacheKafkaMetadata) Validate() error {
 	if a.LagRatio != 0.0 && a.CommitInterval == 0 {
 		return fmt.Errorf("commitInterval is required with lagRatio")
 	}
-
+	if a.RatioMeasurementMinPeriod <= 0 {
+		return fmt.Errorf("ratioMeasurementMinPeriodLagRatio must be a number greater 0")
+	}
 	if a.enableTLS() && ((a.Cert == "") != (a.Key == "")) {
 		return fmt.Errorf("can't set only one of cert or key when using TLS")
 	}
@@ -174,6 +181,7 @@ func NewApacheKafkaScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		logger:              logger,
 		previousOffsets:     previousOffsets,
 		previousLastOffsets: previousLastOffsets,
+		// TODO temporary: how do defaults work?
 	}, nil
 }
 
@@ -525,7 +533,10 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 	// slightly above 0.5. Depending on the luck of the draw, it could come anywhere between 0.0 and slightly
 	// above 1.0 depending when we read the offsets in relation to when consumer offsets are updated.   producer
 	// offsets are updated as the messages are written
-	if writeThroughput > 0 {
+
+	// TODO - temporary
+	if writeThroughput*1000 > s.metadata.MinPartitionWriteThrouput {
+		// if writeThroughput > 0 {
 		residualLag = writeThroughput * float64(s.metadata.CommitInterval) / 2.0
 		ratio = float64(producerOffset-consumerOffset) / residualLag
 	}
@@ -706,12 +717,21 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 }
 
 func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, float64, error) {
+	// check for minimum measure period for lagRatio
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	if s.lastOffetsTime != 0 {
+		mInterval := now - s.lastOffetsTime
+		if mInterval < s.metadata.RatioMeasurementMinPeriod*1000 {
+			s.logger.V(0).Info(fmt.Sprintf("LogRatio: %dms below ratioMeasurementMinPeriod, returning last metric ", mInterval))
+			return s.LastRatioMetric, s.LastRatioMetric, nil
+		}
+		s.logger.V(0).Info(fmt.Sprintf("LogRatio: %dms above ratioMeasurementMinPeriod, recalculating lagRatio", mInterval))
+	}
 
 	topicPartitions, err := s.getTopicPartitions(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
-
 	consumerOffsets, producerOffsets, err := s.getConsumerAndProducerOffsets(ctx, topicPartitions)
 	s.logger.V(5).Info(fmt.Sprintf("Kafka scaler: Consumer offsets %v, producer offsets %v", consumerOffsets, producerOffsets))
 	if err != nil {
@@ -722,8 +742,8 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 	averageLagRatioWithPersistent := float64(0)
 	totalTopicPartitions := int64(0)
 	partitionsWithLag := int64(0)
-	largestRatio := float64(0)
-	topicWithLargestRatio := ""
+	topicLargestRatio := float64(0)
+	topicNameLargestRatio := ""
 
 	for topic, partitionsOffsets := range producerOffsets {
 		// used to record approximate period since last metrics check to calculate per partition write throughout
@@ -762,19 +782,40 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		// averageLagRatioWithPersistent /= float64(partitionsWithLag)
 
 		// largest lagRatio is considered for scaling, different that the total for the treshold scaler
-		if averageLagRatio > largestRatio {
-			largestRatio = averageLagRatio
-			topicWithLargestRatio = topic
+		if averageLagRatio > topicLargestRatio {
+			topicLargestRatio = averageLagRatio
+			topicNameLargestRatio = topic
 		}
 	}
-	if topicWithLargestRatio != "" {
-		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, largest ratio %.6f for group: %s is in topic %s, threshold %.6f", averageLagRatio, s.metadata.Group, topicWithLargestRatio, s.metadata.LagRatio))
+	if topicNameLargestRatio != "" {
+		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, largest ratio %.6f for group: %s is in topic %s, threshold %.6f", averageLagRatio, s.metadata.Group, topicNameLargestRatio, s.metadata.LagRatio))
 	} else {
 		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, group: %s has no topic with lagRatio > 0.0", s.metadata.Group))
 	}
 	if !s.metadata.AllowIdleConsumers {
 		// TODO
 	}
-	return largestRatio, largestRatio, nil
 
+	cappedLogRatio := topicLargestRatio
+	if cappedLogRatio > s.metadata.LagRatio {
+		s.thresholdCount++
+		if s.thresholdCount > s.metadata.MeasurementsForScale {
+			// reset so we return a metric to HPA above targer only once
+			s.thresholdCount = 0
+			// TODO TEST.  when we cross the lagRatio threshold N times, return a metric to HPA
+			// just large enough to add 1 replica at a time for approximatively each ten replicas.
+			cappedLogRatio = 1.11 * s.metadata.LagRatio
+		} else {
+			// we crossed threshold, but not number of measurements requried, just report metric as target
+			// this will not cause any scaling.
+			cappedLogRatio = s.metadata.LagRatio
+		}
+	} else {
+		s.thresholdCount = 0
+	}
+
+	s.logger.V(0).Info(fmt.Sprintf("Final Metric for HPA: %f largest lag ratio was: %f ", cappedLogRatio, topicLargestRatio))
+
+	s.LastRatioMetric = cappedLogRatio
+	return cappedLogRatio, cappedLogRatio, nil
 }
