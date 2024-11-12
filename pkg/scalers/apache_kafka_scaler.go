@@ -275,15 +275,16 @@ func getApacheKafkaClient(ctx context.Context, metadata apacheKafkaMetadata, log
 	return &client, nil
 }
 
-func (s *apacheKafkaScaler) getTopicPartitions(ctx context.Context) (map[string][]int, error) {
+func (s *apacheKafkaScaler) getTopicPartitions(ctx context.Context) (map[string][]int, string, error) {
 	metadata, err := s.client.Metadata(ctx, &kafka.MetadataRequest{
 		Addr: s.client.Addr,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error getting metadata: %w", err)
+		return nil, "", fmt.Errorf("error getting metadata: %w", err)
 	}
 	s.logger.V(5).Info(fmt.Sprintf("Listed topics %v", metadata.Topics))
 
+	var groupState string
 	if len(s.metadata.Topic) == 0 {
 		// in case of empty topic name, we will get all topics that the consumer group is subscribed to
 		describeGrpReq := &kafka.DescribeGroupsRequest{
@@ -299,21 +300,24 @@ func (s *apacheKafkaScaler) getTopicPartitions(ctx context.Context) (map[string]
 		describeGrp, err := s.client.DescribeGroups(ctx, describeGrpReq)
 
 		if err != nil {
-			return nil, fmt.Errorf("error describing group: %w", err)
+			return nil, groupState, fmt.Errorf("error describing group: %w", err)
 		}
 		if len(describeGrp.Groups[0].Members) == 0 {
-			return nil, fmt.Errorf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState)
+			return nil, groupState, fmt.Errorf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState)
 		}
 		s.logger.V(4).Info(fmt.Sprintf("Described group %s with response %v", s.metadata.Group, describeGrp))
 
 		result := make(map[string][]int)
 
 		topicsInGroup := describeGrp.Groups[0].Members[0].MemberMetadata.Topics
+		groupState = describeGrp.Groups[0].GroupState
+		s.logger.V(0).Info(fmt.Sprintf("Consumer Group %s is in state %s", s.metadata.Group, groupState))
 
 		for _, topic := range metadata.Topics {
 			partitions := make([]int, 0)
 			if kedautil.Contains(topicsInGroup, topic.Name) {
 				s.logger.V(0).Info(fmt.Sprintf("YYYYY topic name: %s", topic.Name))
+
 				for _, partition := range topic.Partitions {
 					// if no partitions limitatitions are specified, all partitions are considered
 					if (len(s.metadata.PartitionLimitation) == 0) ||
@@ -324,8 +328,10 @@ func (s *apacheKafkaScaler) getTopicPartitions(ctx context.Context) (map[string]
 			}
 			result[topic.Name] = partitions
 		}
-		return result, nil
+		return result, groupState, nil
 	}
+
+	// TODO refactor this, support group state with topic
 	result := make(map[string][]int)
 	for _, topic := range metadata.Topics {
 		partitions := make([]int, 0)
@@ -339,7 +345,7 @@ func (s *apacheKafkaScaler) getTopicPartitions(ctx context.Context) (map[string]
 		}
 		result[topic.Name] = partitions
 	}
-	return result, nil
+	return result, groupState, nil
 }
 
 func (s *apacheKafkaScaler) getConsumerOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, error) {
@@ -679,7 +685,7 @@ func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricNam
 // totalLag and totalLagWithPersistent are the summations of lag and lagWithPersistent returned by getLagForPartition function respectively.
 // totalLag maybe less than totalLagWithPersistent when excludePersistentLag is set to `true` due to some partitions deemed as having persistent lag
 func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, error) {
-	topicPartitions, err := s.getTopicPartitions(ctx)
+	topicPartitions, _, err := s.getTopicPartitions(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -730,7 +736,7 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 
 func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, float64, error) {
 
-	topicPartitions, err := s.getTopicPartitions(ctx)
+	topicPartitions, groupState, err := s.getTopicPartitions(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -845,8 +851,14 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		}
 	*/
 
-	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %f, lag ratio: %f, throughput: %f, Recoreded scale down topic/throughput: %s/%f, counts up/down: %d/%d",
-		cappedLogRatio, topicLargestRatio, topicWriteThroughput*1000, s.topicNameLastScaleUp, s.wThrougoutLastScaleUp*1000, s.thresholdCountUp, s.thresholdCountDown))
+	if groupState != "" && groupState != "Stable" {
+		s.logger.V(0).Info(fmt.Sprintf("Reset thresholds, group: %s in state %s", s.metadata.Group, groupState))
+		s.thresholdCountUp = 0
+		s.thresholdCountDown = 0
+	}
+
+	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %f, group %s/%s lag ratio: %f on topic: %s, throughput: %f, Recoreded scale down topic/throughput: %s/%f, counts up/down: %d/%d",
+		cappedLogRatio, s.metadata.Group, groupState, topicLargestRatio, topicNameLargestRatio, topicWriteThroughput*1000, s.topicNameLastScaleUp, s.wThrougoutLastScaleUp*1000, s.thresholdCountUp, s.thresholdCountDown))
 
 	return cappedLogRatio, cappedLogRatio, nil
 }
