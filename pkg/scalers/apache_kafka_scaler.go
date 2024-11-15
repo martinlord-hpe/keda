@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -41,18 +42,22 @@ import (
 )
 
 type apacheKafkaScaler struct {
-	metricType            v2.MetricTargetType
-	metadata              apacheKafkaMetadata
-	client                *kafka.Client
-	logger                logr.Logger
-	previousOffsets       map[string]map[int]int64
-	previousLastOffsets   map[string]map[int]int64
-	lastOffetsTime        int64
-	thresholdCountUp      int64
-	thresholdCountDown    int64
-	wThrougoutLastScaleUp float64
-	topicNameLastScaleUp  string
+	metricType              v2.MetricTargetType
+	metadata                apacheKafkaMetadata
+	client                  *kafka.Client
+	logger                  logr.Logger
+	previousConsumerOffsets map[string]map[int]int64
+	previousLastOffsets     map[string]map[int]int64
+	lastOffetsTime          int64
+	thresholdCountUp        int64
+	thresholdCountDown      int64
+	wThrougoutLastScaleUp   float64
+	topicNameLastScaleUp    string
 }
+
+const (
+	invalidPartitionOffset = int64(-1)
+)
 
 type apacheKafkaMetadata struct {
 	BootstrapServers       []string          `keda:"name=bootstrapServers,       order=triggerMetadata;resolvedEnv"`
@@ -173,16 +178,17 @@ func NewApacheKafkaScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		return nil, err
 	}
 
-	previousOffsets := make(map[string]map[int]int64)
+	previousConsumerOffsets := make(map[string]map[int]int64)
 	previousLastOffsets := make(map[string]map[int]int64)
 
 	return &apacheKafkaScaler{
-		client:              client,
-		metricType:          metricType,
-		metadata:            kafkaMetadata,
-		logger:              logger,
-		previousOffsets:     previousOffsets,
-		previousLastOffsets: previousLastOffsets,
+		client:                  client,
+		metricType:              metricType,
+		metadata:                kafkaMetadata,
+		logger:                  logger,
+		previousConsumerOffsets: previousConsumerOffsets,
+		previousLastOffsets:     previousLastOffsets,
+		topicNameLastScaleUp:    "Not Set",
 	}, nil
 }
 
@@ -417,7 +423,7 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 	}
 
 	consumerOffset := consumerOffsets[topic][partitionID]
-	if consumerOffset == invalidOffset && s.metadata.OffsetResetPolicy == latest {
+	if consumerOffset == invalidPartitionOffset && s.metadata.OffsetResetPolicy == latest {
 		retVal := int64(1)
 		if s.metadata.ScaleToZeroOnInvalidOffset {
 			retVal = 0
@@ -434,7 +440,7 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 	}
 	producerOffset := producerOffsets[topic][partitionID]
 
-	if consumerOffset == invalidOffset && s.metadata.OffsetResetPolicy == earliest {
+	if consumerOffset == invalidPartitionOffset && s.metadata.OffsetResetPolicy == earliest {
 		if s.metadata.ScaleToZeroOnInvalidOffset {
 			return 0, 0, nil
 		}
@@ -443,14 +449,14 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 
 	// This code block tries to prevent KEDA Kafka trigger from scaling the scale target based on erroneous events
 	if s.metadata.ExcludePersistentLag {
-		switch previousOffset, found := s.previousOffsets[topic][partitionID]; {
+		switch previousOffset, found := s.previousConsumerOffsets[topic][partitionID]; {
 		case !found:
 			// No record of previous offset, so store current consumer offset
 			// Allow this consumer lag to be considered in scaling
-			if _, topicFound := s.previousOffsets[topic]; !topicFound {
-				s.previousOffsets[topic] = map[int]int64{partitionID: consumerOffset}
+			if _, topicFound := s.previousConsumerOffsets[topic]; !topicFound {
+				s.previousConsumerOffsets[topic] = map[int]int64{partitionID: consumerOffset}
 			} else {
-				s.previousOffsets[topic][partitionID] = consumerOffset
+				s.previousConsumerOffsets[topic][partitionID] = consumerOffset
 			}
 		case previousOffset == consumerOffset:
 			// Indicates consumer is still on the same offset as the previous polling cycle, there may be some issue with consuming this offset.
@@ -458,7 +464,7 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 			return 0, producerOffset - consumerOffset, nil
 		default:
 			// Successfully Consumed some messages, proceed to change the previous offset
-			s.previousOffsets[topic][partitionID] = consumerOffset
+			s.previousConsumerOffsets[topic][partitionID] = consumerOffset
 		}
 	}
 
@@ -466,6 +472,55 @@ func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, co
 	s.logger.V(4).Info(fmt.Sprintf("Producer offset for topic %s in group %s and partition %d is %d", topic, s.metadata.Group, partitionID, producerOffset))
 
 	return producerOffset - consumerOffset, producerOffset - consumerOffset, nil
+}
+
+func (s *apacheKafkaScaler) getCurrentAndUpdatePreivouOffsets(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (int64, int64, int64, int64) {
+
+	consumerOffset := invalidPartitionOffset
+	previousConsumerOffset := invalidPartitionOffset
+	var found bool
+	if len(consumerOffsets) != 0 {
+		consumerOffset = consumerOffsets[topic][partitionID]
+		previousConsumerOffset, found = s.previousConsumerOffsets[topic][partitionID]
+		s.logger.V(3).Info(fmt.Sprintf("Got Committed Offset %d, Previous Committed Offset %d for %s:%d", consumerOffset, previousConsumerOffset, topic, partitionID))
+		switch {
+		case !found:
+			// No record of previous comitted offset, just store current topic and committed offset
+			if _, topicFound := s.previousConsumerOffsets[topic]; !topicFound {
+				s.previousConsumerOffsets[topic] = map[int]int64{partitionID: consumerOffset}
+			} else {
+				s.previousConsumerOffsets[topic][partitionID] = consumerOffset
+			}
+			previousConsumerOffset = invalidPartitionOffset
+		default:
+			s.previousConsumerOffsets[topic][partitionID] = consumerOffset
+		}
+	}
+
+	producerOffset := invalidPartitionOffset
+	previousProducerOffset := invalidPartitionOffset
+	if len(producerOffsets) != 0 {
+		producerOffset = producerOffsets[topic][partitionID]
+		previousProducerOffset, found = s.previousLastOffsets[topic][partitionID]
+		s.logger.V(3).Info(fmt.Sprintf("Got last Offset %d, Previous last Offset %d for %s:%d, no previous consumer offset value", producerOffset, previousProducerOffset, topic, partitionID))
+		switch {
+		case !found:
+			// No record of previous last offset, store current producer offset
+			if _, topicFound := s.previousLastOffsets[topic]; !topicFound {
+				s.previousLastOffsets[topic] = map[int]int64{partitionID: producerOffset}
+			} else {
+				s.previousLastOffsets[topic][partitionID] = producerOffset
+			}
+			previousProducerOffset = invalidPartitionOffset
+		default:
+			s.previousLastOffsets[topic][partitionID] = producerOffset
+		}
+	}
+
+	s.logger.V(0).Info(fmt.Sprintf("Offsets for group %s topic partition %s:%d, , Last Offset %d, Previous Last Offset %d Committed Offset %d, Previous Committed Offset %d", s.metadata.Group, topic, partitionID, producerOffset, previousProducerOffset, consumerOffset, previousConsumerOffset))
+
+	return consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset
+
 }
 
 /*
@@ -478,66 +533,41 @@ When excludePersistentLag is set to `true`, if partition is deemed to have persi
 will be set to minLagRatio and lagRatioWithPersistent will be regular calculation
 These return values will allow proper scaling from 0 -> 1 replicas by the IsActive func.
 */
-func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID int, now int64, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (float64, float64, error) {
-	if len(consumerOffsets) == 0 {
-		return 0, 0, fmt.Errorf("consumerOffsets is empty")
+func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID int, now int64, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (float64, float64, float64, int64, int64, error) {
+	// Read all the offsets for the topic partition, update previous offsets.
+	consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset := s.getCurrentAndUpdatePreivouOffsets(topic, partitionID, consumerOffsets, producerOffsets)
+	if previousConsumerOffset == invalidPartitionOffset || previousProducerOffset == invalidPartitionOffset {
+		s.logger.V(1).Info(fmt.Sprintf("YYY Previous offsets not available (perhaps first check?), cannot compute metrics"))
+		// YYY return
+		return 0, 0, 0, 0, 0, nil
 	}
-	if len(producerOffsets) == 0 {
-		return 0, 0, fmt.Errorf("producerOffsets is empty")
+	if consumerOffset == invalidPartitionOffset || producerOffset == invalidPartitionOffset {
+		s.logger.V(1).Info(fmt.Sprintf("YYY Current offsets could not be read, cannot compute metrics"))
+		// YYY return
+		return 0, 0, 0, 0, 0, nil
 	}
-
-	consumerOffset := consumerOffsets[topic][partitionID]
-	if consumerOffset == invalidOffset {
-		if s.metadata.ScaleToZeroOnInvalidOffset {
-			// TODO - do not use initially
-		}
-		msg := fmt.Sprintf(
-			"Kafka lagRatio, invalid committed offset found for topic %s in group %s and partition %d, probably no offset is committed yet. Returning with lag ratio of %.6f",
-			topic, s.metadata.Group, partitionID, 0.0)
-		s.logger.V(1).Info(msg)
-		return 0.0, 0.0, nil
-	}
-
-	if _, found := producerOffsets[topic]; !found {
-		return 0, 0, fmt.Errorf("error finding partition producer offset for topic %s", topic)
-	}
-	producerOffset := producerOffsets[topic][partitionID]
-	previousProducerOffset, found := s.previousLastOffsets[topic][partitionID]
 	previousLastOffsettime := s.lastOffetsTime
-
-	s.logger.V(3).Info(fmt.Sprintf("Kafka lagRatio, offsets for group %s topic partition %s:%d, producerOffset %d, previousProducerOffset %d, previousLastOffsettime %d", s.metadata.Group, topic, partitionID, producerOffset, previousProducerOffset, previousLastOffsettime))
-
-	switch {
-	case !found:
-		// No record of previous last offset, so store current consumer offset
-		if _, topicFound := s.previousLastOffsets[topic]; !topicFound {
-			s.previousLastOffsets[topic] = map[int]int64{partitionID: producerOffset}
-		} else {
-			s.previousLastOffsets[topic][partitionID] = producerOffset
-		}
-		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, first get metrics call for topic partion %s:%d, scaler needs a previous last offset value, returning 0.0", topic, partitionID))
-		return 0.0, 0.0, nil
-	case previousProducerOffset == producerOffset:
-		s.logger.V(2).Info(fmt.Sprintf("Kafka lagRatio, no writes on topic partition %s:%d since last get metrics call, returning 0.0", topic, partitionID))
-		return 0.0, 0.0, nil
-	default:
-		s.previousLastOffsets[topic][partitionID] = producerOffset
-	}
-
-	// number of messages written to the partition since last run
-	messages := producerOffset - previousProducerOffset
-	if messages < 0 {
-		return 0, 0, fmt.Errorf("lagRatio, unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
-	}
-	// in messages per milliseconds
 	period := now - previousLastOffsettime
 	if period <= 0 {
-		return 0, 0, fmt.Errorf("lagRatio, unexpected error calculating period for topic partition %s:%d", topic, partitionID)
+		// YYY return
+		return 0, 0, 0, 0, 0, fmt.Errorf("YYY unexpected error calculating period for topic partition %s:%d", topic, partitionID)
 	}
-	ratio := 0.0
-	residualLag := 0.0
-	writeThroughput := float64(messages) / float64(period)
-	s.logger.V(2).Info(fmt.Sprintf("Kafka lagRatio Write througput %.3f messages/s for last %.3f seconds for topic partion %s:%d", writeThroughput*1000, float64(period)/1000, topic, partitionID))
+
+	// Write throughput on the partition in messages per milliseconds
+	writtenMsg := producerOffset - previousProducerOffset
+	if writtenMsg < 0 {
+		// YYY
+		return 0, 0, 0, 0, 0, fmt.Errorf("YYY unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
+	}
+	writeThroughput := float64(writtenMsg) / float64(period)
+	// Read throughput on the partition in messages per milliseconds
+	readMsg := consumerOffset - previousConsumerOffset
+	if readMsg < 0 {
+		// YYY
+		return 0, 0, 0, 0, 0, fmt.Errorf("unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
+	}
+	readThroughput := float64(readMsg) / float64(period)
+	s.logger.V(0).Info(fmt.Sprintf("%.3f writes/s, %.3f reads/s for last %.3f seconds for topic partion %s:%d", writeThroughput*1000, readThroughput*1000, float64(period)/1000, topic, partitionID))
 
 	// residualLag is the lag we are expecting to see even if the consumerGroup reads the messages on a
 	// timely basis.  The higher the partition throughput is and the highger the commit interval is
@@ -551,7 +581,9 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 	// slightly above 0.5. Depending on the luck of the draw, it could come anywhere between 0.0 and slightly
 	// above 1.0 depending when we read the offsets in relation to when consumer offsets are updated.   producer
 	// offsets are updated as the messages are written
-
+	partitionLag := producerOffset - consumerOffset
+	ratio := 0.0
+	residualLag := 0.0
 	if writeThroughput*1000 > s.metadata.MinPartitionWriteThrouput {
 		residualLag = writeThroughput * float64(s.metadata.CommitInterval) / 2.0
 		ratio = float64(producerOffset-consumerOffset) / residualLag
@@ -566,7 +598,7 @@ func (s *apacheKafkaScaler) getLagRatioForPartition(topic string, partitionID in
 
 	s.logger.V(2).Info(fmt.Sprintf("Kafka lagRatio %.6f based on residualLag %.6f for topic partion %s:%d", ratio, residualLag, topic, partitionID))
 
-	return ratio, writeThroughput, nil
+	return ratio, writeThroughput, readThroughput, partitionLag, int64(residualLag), nil
 }
 
 // Close closes the kafka client
@@ -665,7 +697,7 @@ func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricNam
 			s.logger.V(5).Info(fmt.Sprintf("GetMetricsAndActivity err %s", err))
 			return []external_metrics.ExternalMetricValue{}, false, err
 		} else {
-			s.logger.V(0).Info(fmt.Sprintf("GetMetricsAndActivity topLagRatio %f", toplLagRatio))
+			s.logger.V(0).Info(fmt.Sprintf("GetMetricsAndActivity topLagRatio %.3f", toplLagRatio))
 		}
 
 		metric := GenerateMetricInMili(metricName, toplLagRatio)
@@ -746,55 +778,63 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		return 0, 0, err
 	}
 
-	averageLagRatio := float64(0)
-	topicWriteThroughput := float64(0)
-	totalTopicPartitions := int64(0)
-	partitionsWithLag := int64(0)
-	//
-	topicLargestRatio := float64(0)
+	// aggregate partitions metrics into topic metrics
+	var topicLag, topicResidualLag, partitionsWithLag, topicPartitionNum int64
+	var topicLagRatio, topicWriteThroughput, topicReadThroughput float64
+	// aggregate topic metrics into consumer group metrics
+	var topicLargestLag, topicLagestResidualLag int64
+	var topicLargestRatio, topicLargestWriteThroughput, topicLargestReadThroughput float64
 	topicNameLargestRatio := ""
-	topiclargestWriteThroughput := float64(0)
 
+	// used to record approximate period since last metrics check to calculate per partition write throughout
 	now := time.Now().UnixNano() / int64(time.Millisecond)
 	for topic, partitionsOffsets := range producerOffsets {
-		// used to record approximate period since last metrics check to calculate per partition write throughout
-
-		averageLagRatio = 0
+		topicLag = 0
+		topicResidualLag = 0
+		topicLagRatio = 0
 		for partition := range partitionsOffsets {
-			lagRatio, writeThroughput, err := s.getLagRatioForPartition(topic, partition, now, consumerOffsets, producerOffsets)
+			lagRatio, writeThroughput, readThroughput, partitionLag, partitionResidualLag, err := s.getLagRatioForPartition(topic, partition, now, consumerOffsets, producerOffsets)
 			if err != nil {
 				return 0.0, 0.0, err
 			}
-			averageLagRatio += lagRatio
+			topicLag += partitionLag
+			topicResidualLag += partitionResidualLag
 			topicWriteThroughput += writeThroughput
+			topicReadThroughput += readThroughput
+			// lagRaio sum is meaningless, divided by number of paritions later
 			if lagRatio > 0 {
+				topicLagRatio += lagRatio
 				partitionsWithLag++
 			}
 		}
-		totalTopicPartitions = (int64)(len(partitionsOffsets))
+
+		// Averable lag ratio overl all partitions or only those with a lag, if imitToPartitionsWithLag is configured.
+		topicPartitionNum = (int64)(len(partitionsOffsets))
 		if s.metadata.LimitToPartitionsWithLag {
 			if partitionsWithLag == 0 {
-				averageLagRatio = 0
+				topicLagRatio = 0
 			} else {
-				averageLagRatio /= float64(partitionsWithLag)
+				topicLagRatio /= float64(partitionsWithLag)
 			}
-			// TODO temporary level 0
-			s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, lagRatio with only %d partitions with lag: %.6f for group: %s, topic: %s", partitionsWithLag, averageLagRatio, s.metadata.Group, topic))
+			s.logger.V(2).Info(fmt.Sprintf("Kafka lagRatio, lagRatio with only %d partitions with lag: %.6f for group: %s, topic: %s", partitionsWithLag, topicLagRatio, s.metadata.Group, topic))
 		} else {
-			averageLagRatio /= float64(totalTopicPartitions)
-			s.logger.V(2).Info(fmt.Sprintf("Kafka lagRatio, lagRatio average across all partitions: %.6f for group: %s, topic: %s", averageLagRatio, s.metadata.Group, topic))
+			topicLagRatio /= float64(topicPartitionNum)
+			s.logger.V(2).Info(fmt.Sprintf("Kafka lagRatio, lagRatio average across all partitions: %.6f for group: %s, topic: %s", topicLagRatio, s.metadata.Group, topic))
 		}
 
-		if averageLagRatio > topicLargestRatio {
+		// At consumer group level, we collect the metrics values for the topic with the largest lagRatio
+		if topicLagRatio > topicLargestRatio {
 			topicNameLargestRatio = topic
-			topicLargestRatio = averageLagRatio
-			topiclargestWriteThroughput = topicWriteThroughput
+			topicLargestRatio = topicLagRatio
+			topicLargestWriteThroughput = topicWriteThroughput
+			topicLargestReadThroughput = topicReadThroughput
+			topicLargestLag = topicLag
+			topicLagestResidualLag = topicResidualLag
 		}
 
-		// Scaling down when write throughput goes down 'enough' from where it was in the scale up.
+		// Scaling down when read throughput goes down 'enough' from where it was in the scale up.
 		if topic == s.topicNameLastScaleUp {
-			// XXX TODO temporary >= 0 - needed to test scale down
-			if topicWriteThroughput >= 0 && topicWriteThroughput < s.wThrougoutLastScaleUp*s.metadata.ScaleDownFactor {
+			if topicReadThroughput > 0 && topicReadThroughput < s.wThrougoutLastScaleUp*s.metadata.ScaleDownFactor {
 				s.thresholdCountDown++
 			} else {
 				s.thresholdCountDown = 0
@@ -804,28 +844,59 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 	s.lastOffetsTime = now
 
 	if topicNameLargestRatio != "" {
-		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, largest ratio %.6f for group: %s is in topic %s, threshold %.6f", averageLagRatio, s.metadata.Group, topicNameLargestRatio, s.metadata.LagRatio))
+		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, largest ratio %.6f for group: %s is in topic %s, threshold %.6f", topicLagRatio, s.metadata.Group, topicNameLargestRatio, s.metadata.LagRatio))
 	} else {
 		s.logger.V(1).Info(fmt.Sprintf("Kafka lagRatio, group: %s has no topic with lagRatio > 0.0", s.metadata.Group))
 	}
 
+	hpaMetric := float64(1.0)
 	cappedLogRatio := topicLargestRatio
 	if cappedLogRatio > s.metadata.LagRatio {
 		// above scale up threshold, reset scale down.
 		s.thresholdCountDown = 0
 
 		if s.thresholdCountUp++; s.thresholdCountUp >= s.metadata.MeasurementsForScale {
-			// reset so we return a metric to HPA above targer only once
-			s.thresholdCountUp = 0
-			// When we cross the lagRatio threshold N times, return a metric to HPA
-			// just large enough to add 1 replica at a time for approximatively each ten replicas.
-			// TODO: use HPA policies instead
-			cappedLogRatio = 2.0 * s.metadata.LagRatio
+			if topicLargestReadThroughput > topicLargestWriteThroughput {
+				// LagRaio still indicates we are behind, but if read throughput is greate than write
+				// we are catching up.    if the time to catch up is inferior to lagRecoveryTime
+				// we will not add replicas,
+				realLag := topicLargestLag - topicLagestResidualLag
+				lagTimeToNomimal := float64(realLag) / (topicLargestReadThroughput - topicLargestWriteThroughput)
+				/// ZZZ
+				if int64(lagTimeToNomimal*1000) > 600 {
+					// reads faster than writes, but not enough,  multiply metric by 1.11
+					// let hpa policy add replicas as per the policy (1 ot 10% which ever is bigger kind of thing)
+					hpaMetric = 1.11
+				}
+				s.logger.V(0).Info(fmt.Sprintf("YYY 1 realLag %d lagTimeToNomimal (s) %.1f, HPA Metric %f", realLag, lagTimeToNomimal/1000, hpaMetric))
 
-			// scale up event, record topic write through put.
-			s.topicNameLastScaleUp = topicNameLargestRatio
-			s.wThrougoutLastScaleUp = topiclargestWriteThroughput
-			s.logger.V(0).Info(fmt.Sprintf("Kafka lagRatio, Recording write throuput of %f on scale up for group: %s is in topic %s", s.wThrougoutLastScaleUp, s.metadata.Group, topicNameLargestRatio))
+			} else {
+				// LagRaio still indicates we are behind and write throughput greater than read,
+				// Calculate some coservative fator need
+				// TODO parametrize the 0.5
+
+				// HPA metric: desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
+				// Current metric is unfortunately lagRatio, this will multipy the TARGET set in SO
+				hpaMetric = math.Max(1.11, 0.8*topicLargestWriteThroughput/topicLargestReadThroughput)
+				s.logger.V(0).Info(fmt.Sprintf("YYY 2 topicLargestWriteThroughput %.1f, topicLargestReadThroughput %.1f, HPA Metric %.3f", topicLargestWriteThroughput*1000, topicLargestReadThroughput*1000, hpaMetric))
+			}
+
+			if hpaMetric != 1.0 {
+				// above scale up threshold, reset scale down.
+				s.thresholdCountDown = 0
+
+				// reset so we return a metric to HPA above targer only once
+				s.thresholdCountUp = 0
+				// When we cross the lagRatio threshold N times, return a metric to HPA
+				// just large enough to add 1 replica at a time for approximatively each ten replicas.
+				// TODO: use HPA policies instead
+				cappedLogRatio = hpaMetric * s.metadata.LagRatio
+
+				// scale up event, record topic write through put.
+				s.topicNameLastScaleUp = topicNameLargestRatio
+				s.wThrougoutLastScaleUp = topicLargestReadThroughput
+				s.logger.V(0).Info(fmt.Sprintf("Kafka lagRatio, Recording write throuput of %.3f on scale up for group: %s is in topic %s", s.wThrougoutLastScaleUp, s.metadata.Group, topicNameLargestRatio))
+			}
 		} else {
 			// we crossed threshold, but not number of measurements requried, just report metric as target
 			// this will not cause any scaling.
@@ -833,11 +904,11 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		}
 	} else {
 		// below scale down threshold, reset scale up
+		// TODO : this is very cure
 		s.thresholdCountUp = 0
 		if s.thresholdCountDown >= s.metadata.MeasurementsForScale {
 			s.thresholdCountDown = 0
 			cappedLogRatio = topicWriteThroughput / s.wThrougoutLastScaleUp
-
 			s.logger.V(0).Info(fmt.Sprintf("Kafka lagRatio, scaling down group: %s on topic %s", s.metadata.Group, topicNameLargestRatio))
 		} else {
 			cappedLogRatio = s.metadata.LagRatio
@@ -857,8 +928,8 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		s.thresholdCountDown = 0
 	}
 
-	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %f, group %s/%s lag ratio: %f on topic: %s, throughput: %f, Recoreded scale down topic/throughput: %s/%f, counts up/down: %d/%d",
-		cappedLogRatio, s.metadata.Group, groupState, topicLargestRatio, topicNameLargestRatio, topicWriteThroughput*1000, s.topicNameLastScaleUp, s.wThrougoutLastScaleUp*1000, s.thresholdCountUp, s.thresholdCountDown))
+	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %.3f, group: %s/%s, lag ratio: %.3f on topic: %s, write/s: %.1f, read/s: %.1f, Recoreded scale down topic/throughput: %s/%f, counts up/down: %d/%d",
+		cappedLogRatio, s.metadata.Group, groupState, topicLargestRatio, topicNameLargestRatio, topicLargestWriteThroughput*1000, topicLargestReadThroughput*1000, s.topicNameLastScaleUp, s.wThrougoutLastScaleUp*1000, s.thresholdCountUp, s.thresholdCountDown))
 
 	return cappedLogRatio, cappedLogRatio, nil
 }
