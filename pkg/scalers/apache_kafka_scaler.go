@@ -53,6 +53,7 @@ type apacheKafkaScaler struct {
 	thresholdCountDown      int64
 	wThrougoutLastScaleUp   float64
 	topicNameLastScaleUp    string
+	pollingCount            int64
 }
 
 const (
@@ -712,6 +713,7 @@ func (s *apacheKafkaScaler) GetMetricsAndActivity(ctx context.Context, metricNam
 // totalLag and totalLagWithPersistent are the summations of lag and lagWithPersistent returned by getLagForPartition function respectively.
 // totalLag maybe less than totalLagWithPersistent when excludePersistentLag is set to `true` due to some partitions deemed as having persistent lag
 func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, error) {
+	s.pollingCount++
 	topicPartitions, _, err := s.getTopicPartitions(ctx)
 	if err != nil {
 		return 0, 0, err
@@ -762,6 +764,7 @@ func (s *apacheKafkaScaler) getTotalLag(ctx context.Context) (int64, int64, erro
 }
 
 func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, float64, error) {
+	s.pollingCount++
 	topicPartitions, groupState, err := s.getTopicPartitions(ctx)
 	if err != nil {
 		return 0, 0, err
@@ -827,14 +830,26 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 			topicLagestResidualLag = topicResidualLag
 		}
 
-		// Scaling down when read throughput goes down 'enough' from where it was in the scale up.
+		// scale down metrics.
 		if topic == s.topicNameLastScaleUp {
-			if topicReadThroughput > 0 && topicReadThroughput < s.wThrougoutLastScaleUp*s.metadata.ScaleDownFactor {
-				s.thresholdCountDown++
+			// Scaling down when write throughput goes down 'enough' from where it was in the scale up.
+			if topicReadThroughput > 0 && topicWriteThroughput > 0 && topicWriteThroughput < s.wThrougoutLastScaleUp*s.metadata.ScaleDownFactor {
+				margin := 0.8 // arbitrary
+				// Scale down only if read throughput does not fall under write throuhput.
+				if topicReadThroughput > topicWriteThroughput*margin {
+					s.thresholdCountDown++
+				}
 			} else {
 				s.thresholdCountDown = 0
 			}
 		}
+	}
+	if s.pollingCount > 5 && s.topicNameLastScaleUp == "" {
+		// record current topic write throughput on startup as a baseline.
+		// this is not great, this assumes that the current replicas cont is appropriate for writeThrouhout at scaler start up
+		// 5 is arbitrary time to allow for stable metrics.
+		s.topicNameLastScaleUp = topicNameLargestRatio
+		s.wThrougoutLastScaleUp = topicLargestWriteThroughput
 	}
 	s.lastOffetsTime = now
 
@@ -893,7 +908,7 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 
 				// scale up event, record topic write through put.
 				s.topicNameLastScaleUp = topicNameLargestRatio
-				s.wThrougoutLastScaleUp = topicLargestReadThroughput
+				s.wThrougoutLastScaleUp = topicLargestWriteThroughput
 				s.logger.V(0).Info(fmt.Sprintf("Kafka lagRatio, Recording read throuput of %.3f on scale up for group: %s is in topic %s", s.wThrougoutLastScaleUp, s.metadata.Group, topicNameLargestRatio))
 			}
 		} else {
@@ -902,11 +917,10 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 			cappedLogRatio = s.metadata.LagRatio
 		}
 	} else {
-		// below scale down threshold, reset scale up
+		// reset scale up, lagRatio under threshold
 		s.thresholdCountUp = 0
 		if s.thresholdCountDown >= s.metadata.MeasurementsForScale {
 			s.thresholdCountDown = 0
-
 			// HPA metric: desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
 			// with the above algo in HPA, if we want to down scale from up to 3 to 2, this value must be low
 			// using policies to soften
@@ -924,8 +938,8 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		s.thresholdCountDown = 0
 	}
 
-	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %.3f, lag ratio: %.3fs, counts up/down: %d/%d, write/s: %6.1f, read/s: %6.1f, Scale down on topic/throughput: %s/%f, group: %s/%s on topic: %s",
-		cappedLogRatio, topicLargestRatio, s.thresholdCountUp, s.thresholdCountDown, topicLargestWriteThroughput*1000, topicLargestReadThroughput*1000, s.topicNameLastScaleUp, s.wThrougoutLastScaleUp*1000, s.metadata.Group, groupState, topicNameLargestRatio))
+	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %.3f, Group state:%s, lag ratio: %.3fs, counts up/down: %d/%d, lag:%d, write/s: %.1f, read/s: %.1f, Scale down on topic/throughput: %s/%.1f, group: %s on topic: %s",
+		cappedLogRatio, groupState, topicLargestRatio, s.thresholdCountUp, s.thresholdCountDown, topicLargestLag, topicLargestWriteThroughput*1000, topicLargestReadThroughput*1000, s.topicNameLastScaleUp, s.wThrougoutLastScaleUp*1000, s.metadata.Group, topicNameLargestRatio))
 
 	return cappedLogRatio, cappedLogRatio, nil
 
