@@ -54,6 +54,7 @@ type apacheKafkaScaler struct {
 	wThrougoutLastScaleUp   float64
 	topicNameLastScaleUp    string
 	pollingCount            int64
+	pollingStableCount      int64
 }
 
 const (
@@ -844,13 +845,7 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 			}
 		}
 	}
-	if s.pollingCount > 5 && s.topicNameLastScaleUp == "" {
-		// record current topic write throughput on startup as a baseline.
-		// this is not great, this assumes that the current replicas cont is appropriate for writeThrouhout at scaler start up
-		// 5 is arbitrary time to allow for stable metrics.
-		s.topicNameLastScaleUp = topicNameLargestRatio
-		s.wThrougoutLastScaleUp = topicLargestWriteThroughput
-	}
+
 	s.lastOffetsTime = now
 
 	if topicNameLargestRatio != "" {
@@ -936,6 +931,30 @@ func (s *apacheKafkaScaler) getTotalLagRatio(ctx context.Context) (float64, floa
 		s.logger.V(1).Info(fmt.Sprintf("Reset measurements counts for group: %s in state %s", s.metadata.Group, groupState))
 		s.thresholdCountUp = 0
 		s.thresholdCountDown = 0
+	}
+
+	// Scale Down shenanigans.
+	if cappedLogRatio == s.metadata.LagRatio {
+		// metric = TARGET
+		// bad code alert.   this assumes the polling interval = 60s so 30 is for 30 minutes
+		// stable no scaling for 30 minutes
+		if s.pollingStableCount++; s.pollingStableCount > 30 {
+			if s.topicNameLastScaleUp == topicNameLargestRatio { // that's a limitation....
+				if topicLargestWriteThroughput > s.wThrougoutLastScaleUp {
+					// set curent as new base line.
+					s.topicNameLastScaleUp = topicNameLargestRatio
+					s.wThrougoutLastScaleUp = topicLargestWriteThroughput
+				}
+			}
+		}
+	}
+	// one time only
+	if s.pollingCount > 5 && s.topicNameLastScaleUp == "Not Set" {
+		// record current topic write throughput on startup as a baseline.
+		// this is not great, this assumes that the current replicas cont is appropriate for writeThrouhout at scaler start up
+		// 5 is arbitrary time to allow for stable metrics.
+		s.topicNameLastScaleUp = topicNameLargestRatio
+		s.wThrougoutLastScaleUp = topicLargestWriteThroughput
 	}
 
 	s.logger.V(0).Info(fmt.Sprintf("HPA Metric: %.3f, Group state:%s, lag ratio: %.3fs, counts up/down: %d/%d, lag:%d, write/s: %.1f, read/s: %.1f, Scale down on topic/throughput: %s/%.1f, group: %s on topic: %s",
