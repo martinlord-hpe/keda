@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+
 	//	"math"
 	"strings"
 	//	"time"
@@ -207,6 +208,8 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK)
+	meta.SASLType = KafkaSASLTypeNone
+
 	// meta. meta.ScalerIndexIndex = config.ScalerIndex
 	return &meta, nil
 }
@@ -223,7 +226,7 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		return nil, fmt.Errorf("error parsing kafka streams scaler metadata: %w", err)
 	}
 
-	logger := InitializeLogger(config, "apache_kafka_scaler")
+	logger := InitializeLogger(config, "kafka_streams_scaler")
 	client, err := getKafkaGoClient(ctx, *meta, logger)
 	if err != nil {
 		return nil, err
