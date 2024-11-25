@@ -80,7 +80,7 @@ type kafkaStreamsScaler struct {
 }
 
 const (
-	invalidPartitionOffset = int64(-1)
+	noPartitionOffset = int64(-1)
 	// default Values for trigger parameters
 	defaultLagRatio                  = 3.0
 	defaultCommitInterval            = 30000
@@ -389,11 +389,11 @@ func (s *kafkaStreamsScaler) getPartitionMetric(topic string, partitionID int, c
 	var partitionMetrics kafkaPartitionMetrics
 	// Read all the offsets for the topic partition, update previous offsets.
 	consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset := s.getCurrentAndUpdatePreivouOffsets(topic, partitionID, consumerOffsets, producerOffsets)
-	if previousConsumerOffset == invalidPartitionOffset || previousProducerOffset == invalidPartitionOffset {
+	if previousConsumerOffset == noPartitionOffset || previousProducerOffset == noPartitionOffset {
 		s.logger.V(1).Info("Previous offsets not available (perhaps first check?), cannot compute metrics")
 		return partitionMetrics, nil
 	}
-	if consumerOffset == invalidPartitionOffset || producerOffset == invalidPartitionOffset {
+	if consumerOffset == noPartitionOffset || producerOffset == noPartitionOffset {
 		s.logger.V(1).Info("Current offsets could not be read, cannot compute metrics")
 		return partitionMetrics, nil
 	}
@@ -627,10 +627,10 @@ func (s *kafkaStreamsScaler) getProducerOffsets(ctx context.Context, topicPartit
 
 func (s *kafkaStreamsScaler) getCurrentAndUpdatePreivouOffsets(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (int64, int64, int64, int64) {
 
-	consumerOffset := invalidPartitionOffset
-	previousConsumerOffset := invalidPartitionOffset
-	producerOffset := invalidPartitionOffset
-	previousProducerOffset := invalidPartitionOffset
+	consumerOffset := noPartitionOffset
+	previousConsumerOffset := noPartitionOffset
+	producerOffset := noPartitionOffset
+	previousProducerOffset := noPartitionOffset
 	var found bool
 
 	if len(consumerOffsets) != 0 {
@@ -645,7 +645,7 @@ func (s *kafkaStreamsScaler) getCurrentAndUpdatePreivouOffsets(topic string, par
 			} else {
 				s.previousConsumerOffsets[topic][partitionID] = consumerOffset
 			}
-			previousConsumerOffset = invalidPartitionOffset
+			previousConsumerOffset = noPartitionOffset
 		default:
 			s.previousConsumerOffsets[topic][partitionID] = consumerOffset
 		}
@@ -663,7 +663,7 @@ func (s *kafkaStreamsScaler) getCurrentAndUpdatePreivouOffsets(topic string, par
 			} else {
 				s.previousLastOffsets[topic][partitionID] = producerOffset
 			}
-			previousProducerOffset = invalidPartitionOffset
+			previousProducerOffset = noPartitionOffset
 		default:
 			s.previousLastOffsets[topic][partitionID] = producerOffset
 		}
