@@ -45,30 +45,31 @@ import (
 )
 
 type kafkaPartitionMetrics struct {
-	writeRate, readRate float64
-	lag, residualLag    int64
-	lagRatio            float64
+	writeRate, readRate float64 // Rates in msg/millisecond
+	lag, residualLag    int64   // in number of messages
+	lagRatio            float64 // no unit, lag/residualLag
+
 }
 
 type kafkaTopicMetrics struct {
-	writeRate, readRate float64
-	lag, residualLag    int64
-	lagRatio            float64
-	period              int64
-	partitionsWithLag   int64
-	partitionsTotal     int64
+	writeRate, readRate float64 // Rates in msg/millisecond
+	lag, residualLag    int64   // in number of messages
+	lagRatio            float64 // no unit, lag/residualLag
+	period              int64   // number of milliseconds over which above rates are calculated
+	partitionsWithLag   int64   // topic partitions with a measurable lag
+	partitionsTotal     int64   // total partitions in the topic
 }
 
 type kafkaStreamsScaler struct {
 	metricType v2.MetricTargetType
-	metadata   *kafkaStreamsMetadata
-	client     *kafka.Client
+	metadata   *kafkaStreamsMetadata // scaler config from coarse validation of user input + default values
+	client     *kafka.Client         // kafka-go client
 	logger     logr.Logger
 	// Scaler state
-	previousConsumerOffsets map[string]map[int]int64
-	previousLastOffsets     map[string]map[int]int64
-	topicMetrics            map[string]kafkaTopicMetrics
-	lastOffetsTime          int64
+	previousConsumerOffsets map[string]map[int]int64     // committed offsets for all the topic parttions in last poll
+	previousLastOffsets     map[string]map[int]int64     // last offsets for all the topic parttions in last poll
+	lastOffetsTime          int64                        // timestamp where all those offsets were read
+	topicMetrics            map[string]kafkaTopicMetrics // Calculated metrics for each topic used for scaling decisions
 	/*
 		thresholdCountUp      int64
 		thresholdCountDown    int64
@@ -76,19 +77,20 @@ type kafkaStreamsScaler struct {
 		topicNameLastScaleUp  string
 		pollingStableCount    int64
 	*/
-	pollingCount int64
+	pollingCount int64 // number of times the getMetricsAndActivity() API was called by keda.
 }
 
 const (
 	noPartitionOffset = int64(-1)
 	// default Values for trigger parameters
 	defaultLagRatio                  = 3.0
-	defaultCommitInterval            = 30000
-	defaultMinPartitionWriteThrouput = 0.5
-	defaultMeasurementsForScale      = 3
-	defaultScaleDownFactor           = 0.75
-	defaultAllowIdleConsumers        = false
-	defaultLimitToPartitionsWithLag  = true
+	defaultCommitInterval            = 30000 // milliseconds
+	defaultMinPartitionWriteThrouput = 0.5   // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
+	defaultMeasurementsForScale      = 3     // number of polling intervals where conditions for scale up/down are met before action
+	defaultScaleDownFactor           = 0.75  //
+	defaultAllowIdleConsumers        = false // by default, do not create more replicas than the number of partitions on the topic
+	// with most partitions in the consumerGroup.
+	defaultLimitToPartitionsWithLag = true // when true, average lagratio at the topic level ignoring partitions with no writes.
 )
 
 type kafkaStreamsMetadata struct {
@@ -107,6 +109,7 @@ type kafkaStreamsMetadata struct {
 	LimitToPartitionsWithLag  bool
 
 	// Authenticaltion, copied from apache-kafka implementation
+	// TODO: Not implemented!
 	// SASL
 	SASLType kafkaSaslType
 	Username string
@@ -126,7 +129,7 @@ type kafkaStreamsMetadata struct {
 }
 
 func (a *kafkaStreamsMetadata) enableTLS() bool {
-	// TODO
+	// TODO: Not implemented!  No authentication
 	return false
 	// return a.TLS == stringEnable
 }
@@ -234,14 +237,12 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
-		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
+		return nil, err
 	}
-
 	meta, err := parseKafkaStreamsMetadata(config)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing kafka streams scaler metadata: %w", err)
+		return nil, err
 	}
-
 	logger := InitializeLogger(config, "kafka_streams_scaler")
 	client, err := getKafkaGoClient(ctx, *meta, logger)
 	if err != nil {
@@ -262,68 +263,6 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		topicMetrics:            topicMetrics,
 		// topicNameLastScaleUp:    "Not Set",
 	}, nil
-}
-
-// Scaler Interface GetMetricsAndActivity()
-func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	// TO DO
-	s.logger.V(1).Info("GetMetricsAndActivity!!!")
-
-	metricVal, err := s.getMetricForHPA(ctx)
-	if err != nil {
-		s.logger.V(3).Info(fmt.Sprintf("GetMetricsAndActivity err %s", err))
-		return []external_metrics.ExternalMetricValue{}, false, err
-	}
-
-	metric := GenerateMetricInMili(metricName, metricVal)
-	return []external_metrics.ExternalMetricValue{metric}, true, nil
-
-	/*
-
-		toplLagRatio, _, err := s.getTotalLagRatio(ctx)
-		if err != nil {
-			s.logger.V(5).Info(fmt.Sprintf("GetMetricsAndActivity err %s", err))
-			return []external_metrics.ExternalMetricValue{}, false, err
-		} else {
-			s.logger.V(0).Info(fmt.Sprintf("GetMetricsAndActivity topLagRatio %.3f", toplLagRatio))
-		}
-
-		metric := GenerateMetricInMili(metricName, toplLagRatio)
-		return []external_metrics.ExternalMetricValue{metric}, true, nil
-	*/
-
-}
-
-// Scaler Interface GetMetricSpecForScaling()
-func (s *kafkaStreamsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
-	s.logger.V(2).Info("GetMetricSpecForScaling")
-
-	metricName := fmt.Sprintf("kafka-streams-%s-topics", s.metadata.Group)
-	// TODO define a better HPA TARGET
-	metricTarget := s.metadata.LagRatio
-	externalMetric := &v2.ExternalMetricSource{
-		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
-		},
-		Target: GetMetricTargetMili(s.metricType, metricTarget),
-	}
-	metricSpec := v2.MetricSpec{External: externalMetric, Type: "External"}
-	s.logger.V(2).Info(fmt.Sprintf("kafka-streams metric name: %s", metricName))
-	return []v2.MetricSpec{metricSpec}
-}
-
-// Close closes the kafka client
-func (s *kafkaStreamsScaler) Close(context.Context) error {
-	s.logger.V(2).Info("Close!!!")
-
-	if s.client == nil {
-		return nil
-	}
-	transport := s.client.Transport.(*kafka.Transport)
-	if transport != nil {
-		transport.CloseIdleConnections()
-	}
-	return nil
 }
 
 func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger logr.Logger) (*kafka.Client, error) {
@@ -385,74 +324,85 @@ func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger
 	return &client, nil
 }
 
-func (s *kafkaStreamsScaler) getPartitionMetric(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64, now int64) (kafkaPartitionMetrics, error) {
-	var partitionMetrics kafkaPartitionMetrics
-	// Read all the offsets for the topic partition, update previous offsets.
-	consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset := s.getCurrentAndUpdatePreivouOffsets(topic, partitionID, consumerOffsets, producerOffsets)
-	if previousConsumerOffset == noPartitionOffset || previousProducerOffset == noPartitionOffset {
-		s.logger.V(1).Info("Previous offsets not available (perhaps first check?), cannot compute metrics")
-		return partitionMetrics, nil
+// Scaler Interface: GetMetricsAndActivity()
+func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+	metricVal, err := s.getMetricForHPA(ctx)
+	if err != nil {
+		s.logger.V(3).Info(fmt.Sprintf("GetMetricsAndActivity err %s", err))
+		return []external_metrics.ExternalMetricValue{}, false, err
 	}
-	if consumerOffset == noPartitionOffset || producerOffset == noPartitionOffset {
-		s.logger.V(1).Info("Current offsets could not be read, cannot compute metrics")
-		return partitionMetrics, nil
-	}
-	previousLastOffsettime := s.lastOffetsTime
-	period := now - previousLastOffsettime
 
-	if period <= 0 {
-		return partitionMetrics, fmt.Errorf("unexpected error calculating period for topic partition %s:%d", topic, partitionID)
-	}
-	// Write throughput on the partition in messages per milliseconds
-	writtenMsg := producerOffset - previousProducerOffset
-	if writtenMsg < 0 {
-		return partitionMetrics, fmt.Errorf("unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
-	}
-	partitionMetrics.writeRate = float64(writtenMsg) / float64(period)
-	// Read throughput on the partition in messages per milliseconds
-	readMsg := consumerOffset - previousConsumerOffset
-	if readMsg < 0 {
-		return partitionMetrics, fmt.Errorf("unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
-	}
-	partitionMetrics.readRate = float64(readMsg) / float64(period)
-	s.logger.V(1).Info(fmt.Sprintf("%.3f writes/s, %.3f reads/s for last %.3f seconds for topic partion %s:%d", partitionMetrics.writeRate*1000, partitionMetrics.readRate*1000, float64(period)/1000, topic, partitionID))
+	metric := GenerateMetricInMili(metricName, metricVal)
+	return []external_metrics.ExternalMetricValue{metric}, true, nil
+}
 
-	partitionMetrics.lag = producerOffset - consumerOffset
-	// very low write throughput, under 1 msg/s ballpark, can produce high lag ratio, not coutntion those
-	if partitionMetrics.writeRate*1000 > s.metadata.MinPartitionWriteThrouput {
-		partitionMetrics.residualLag = int64(partitionMetrics.writeRate * float64(s.metadata.CommitInterval) / 2.0)
-		partitionMetrics.lagRatio = float64(partitionMetrics.lag) / float64(partitionMetrics.residualLag)
+// Scaler Interface: GetMetricSpecForScaling()
+func (s *kafkaStreamsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
+	s.logger.V(2).Info("GetMetricSpecForScaling")
+
+	metricName := fmt.Sprintf("kafka-streams-%s-topics", s.metadata.Group)
+	// TODO define a better HPA TARGET
+	metricTarget := s.metadata.LagRatio
+	externalMetric := &v2.ExternalMetricSource{
+		Metric: v2.MetricIdentifier{
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(metricName)),
+		},
+		Target: GetMetricTargetMili(s.metricType, metricTarget),
 	}
-	s.logger.V(1).Info(fmt.Sprintf("lagRatio %.6f based on residualLag %d for topic partion %s:%d", partitionMetrics.lagRatio, partitionMetrics.residualLag, topic, partitionID))
-	return partitionMetrics, nil
+	metricSpec := v2.MetricSpec{External: externalMetric, Type: "External"}
+	s.logger.V(2).Info(fmt.Sprintf("kafka-streams metric name: %s", metricName))
+	return []v2.MetricSpec{metricSpec}
+}
+
+// Scaler Interface: Clos()
+func (s *kafkaStreamsScaler) Close(context.Context) error {
+	s.logger.V(2).Info("Close!!!")
+
+	if s.client == nil {
+		return nil
+	}
+	// TODO: from apache-kafka scaler, not tested, not sure this work
+	transport := s.client.Transport.(*kafka.Transport)
+	if transport != nil {
+		transport.CloseIdleConnections()
+	}
+	return nil
 }
 
 func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, error) {
 	s.pollingCount++
 	hpaMetric := s.metadata.LagRatio
-
 	s.logger.V(2).Info(fmt.Sprintf("getMetricForHPA: ctx: %+v ", ctx))
 
+	s.getAllConsumerGroupMetrics(ctx)
+
+	// TODO - scaling decisions from metrics go here.
+
+	return hpaMetric, nil
+}
+
+func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) error {
 	topicPartitions, groupState, err := s.getTopicPartitions(ctx)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	s.logger.V(1).Info(fmt.Sprintf("Group %s, state: %s: number of topics: %d ", s.metadata.Group, groupState, len(topicPartitions)))
 
 	consumerOffsets, producerOffsets, err := s.getAllOffsets(ctx, topicPartitions)
 	s.logger.V(2).Info(fmt.Sprintf("Group %s, Consumer offsets %v, producer offsets %v", s.metadata.Group, consumerOffsets, producerOffsets))
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	// used to record approximate period since last metrics check to calculate per partition write throughout
+	// Kafka metrics have variation, no brain surgery precision required.
 	now := time.Now().UnixNano() / int64(time.Millisecond)
 	for topic, partitionsOffsets := range producerOffsets {
 		tmetrics := kafkaTopicMetrics{}
 		for partition := range partitionsOffsets {
 			pmetrics, err := s.getPartitionMetric(topic, partition, consumerOffsets, producerOffsets, now)
 			if err != nil {
-				return 0, err
+				return err
 			}
 			tmetrics.lag += pmetrics.lag
 			tmetrics.residualLag += pmetrics.residualLag
@@ -467,7 +417,7 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 		}
 
 		if tmetrics.partitionsWithLag > 0 {
-			// Not clear if it ever make sense to set LimitToPartitionsWithLag to false, default is try
+			// Not clear if it ever make sense to set LimitToPartitionsWithLag to false, default is true
 			if s.metadata.LimitToPartitionsWithLag {
 				tmetrics.lagRatio /= float64(tmetrics.partitionsWithLag)
 			} else {
@@ -479,12 +429,14 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 		tmetrics.period = now - s.lastOffetsTime
 		s.topicMetrics[topic] = tmetrics
 	}
+	// important, update the time we gathered partititon metrics for rates calculations
 	s.lastOffetsTime = now
 
+	// log the metrics aggregated for all the topics in the Consumer Group
 	for name, topicMetrics := range s.topicMetrics {
-		s.logger.V(0).Info(fmt.Sprintf("Group: %s, topic %s, lagRatio: %.3f, lag: %d, partitions/with lag: %d/%d, Write/s %.3f, Read/s %.3f, interval: %d", s.metadata.Group, name, topicMetrics.lagRatio, topicMetrics.lag, topicMetrics.partitionsTotal, topicMetrics.partitionsWithLag, topicMetrics.writeRate, topicMetrics.readRate, topicMetrics.period))
+		s.logger.V(0).Info(fmt.Sprintf("Group: %s, topic %s, lagRatio: %.3f, lag: %d, partitions/with lag: %d/%d, Write/s %.3f, Read/s %.3f, interval(ms): %d", s.metadata.Group, name, topicMetrics.lagRatio, topicMetrics.lag, topicMetrics.partitionsTotal, topicMetrics.partitionsWithLag, topicMetrics.writeRate*1000, topicMetrics.readRate*1000, topicMetrics.period))
 	}
-	return hpaMetric, nil
+	return nil
 }
 
 func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string][]int, string, error) {
@@ -538,7 +490,7 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 	return result, groupState, nil
 }
 
-// Unfortunately, the last and Committed offsets must be fetch from different APIs
+// Unfortunately, the Last and Committed Offsets must be fetch from different APIs
 type kafkaStreamsConsumerOffsetResult struct {
 	consumerOffsets map[string]map[int]int64
 	err             error
@@ -548,7 +500,7 @@ type kafkaStreamsProducerOffsetResult struct {
 	err             error
 }
 
-// getConsumerAndProducerOffsets returns (consumerOffsets, producerOffsets, error)
+// Fetch last and committed offsets from broker(s), call the 2 APIs required in threds.
 func (s *kafkaStreamsScaler) getAllOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, map[string]map[int]int64, error) {
 	consumerChan := make(chan kafkaStreamsConsumerOffsetResult, 1)
 	go func() {
@@ -573,6 +525,51 @@ func (s *kafkaStreamsScaler) getAllOffsets(ctx context.Context, topicPartitions 
 	}
 
 	return consumerRes.consumerOffsets, producerRes.producerOffsets, nil
+}
+
+// Calculate per partition Metrics from the current and pretiou offsets stored in the SO.
+func (s *kafkaStreamsScaler) getPartitionMetric(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64, now int64) (kafkaPartitionMetrics, error) {
+	var partitionMetrics kafkaPartitionMetrics
+
+	// Read all the offsets for the topic partition, update previous offsets.
+	consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset := s.getCurrentAndUpdatePreivouOffsets(topic, partitionID, consumerOffsets, producerOffsets)
+	if previousConsumerOffset == noPartitionOffset || previousProducerOffset == noPartitionOffset {
+		s.logger.V(1).Info("Previous offsets not available (perhaps first check?), cannot compute metrics")
+		return partitionMetrics, nil
+	}
+	if consumerOffset == noPartitionOffset || producerOffset == noPartitionOffset {
+		s.logger.V(1).Info("Current offsets could not be read, cannot compute metrics")
+		return partitionMetrics, nil
+	}
+	previousLastOffsettime := s.lastOffetsTime
+	period := now - previousLastOffsettime
+
+	if period <= 0 {
+		return partitionMetrics, fmt.Errorf("unexpected error calculating period for topic partition %s:%d", topic, partitionID)
+	}
+	// Write throughput on the partition in messages per milliseconds
+	writtenMsg := producerOffset - previousProducerOffset
+	if writtenMsg < 0 {
+		return partitionMetrics, fmt.Errorf("unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
+	}
+	partitionMetrics.writeRate = float64(writtenMsg) / float64(period)
+	// Read throughput on the partition in messages per milliseconds
+	readMsg := consumerOffset - previousConsumerOffset
+	if readMsg < 0 {
+		return partitionMetrics, fmt.Errorf("unexpected error calculating messages/s for topic partition %s:%d", topic, partitionID)
+	}
+	partitionMetrics.readRate = float64(readMsg) / float64(period)
+	// Rates are stored in msg/ms, reported in logs in msg/s, period in ms
+	s.logger.V(1).Info(fmt.Sprintf("%.3f writes/s, %.3f reads/s for last %.3f seconds for topic partion %s:%d", partitionMetrics.writeRate*1000, partitionMetrics.readRate*1000, float64(period)/1000, topic, partitionID))
+
+	partitionMetrics.lag = producerOffset - consumerOffset
+	// very low write throughput, under 1 msg/s ballpark, can produce high lag ratio, not coutntion those
+	if partitionMetrics.writeRate*1000 > s.metadata.MinPartitionWriteThrouput {
+		partitionMetrics.residualLag = int64(partitionMetrics.writeRate * float64(s.metadata.CommitInterval) / 2.0)
+		partitionMetrics.lagRatio = float64(partitionMetrics.lag) / float64(partitionMetrics.residualLag)
+	}
+	s.logger.V(1).Info(fmt.Sprintf("lagRatio %.6f based on residualLag %d for topic partion %s:%d", partitionMetrics.lagRatio, partitionMetrics.residualLag, topic, partitionID))
+	return partitionMetrics, nil
 }
 
 func (s *kafkaStreamsScaler) getConsumerOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, error) {
@@ -625,8 +622,8 @@ func (s *kafkaStreamsScaler) getProducerOffsets(ctx context.Context, topicPartit
 	return producerOffsets, nil
 }
 
+// Warning, not idempotent, as the name implies a call to this is
 func (s *kafkaStreamsScaler) getCurrentAndUpdatePreivouOffsets(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (int64, int64, int64, int64) {
-
 	consumerOffset := noPartitionOffset
 	previousConsumerOffset := noPartitionOffset
 	producerOffset := noPartitionOffset
@@ -672,7 +669,6 @@ func (s *kafkaStreamsScaler) getCurrentAndUpdatePreivouOffsets(topic string, par
 	s.logger.V(1).Info(fmt.Sprintf("Offsets for group %s topic partition %s:%d, , Last Offset %d, Previous Last Offset %d Committed Offset %d, Previous Committed Offset %d", s.metadata.Group, topic, partitionID, producerOffset, previousProducerOffset, consumerOffset, previousConsumerOffset))
 
 	return consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset
-
 }
 
 /*
@@ -707,132 +703,6 @@ func parseApacheKafkaMetadata(config *scalersconfig.ScalerConfig) (apacheKafkaMe
 	return meta, nil
 }
 
-
-
-func (s *apacheKafkaScaler) getTopicPartitions(ctx context.Context) (map[string][]int, string, error) {
-	metadata, err := s.client.Metadata(ctx, &kafka.MetadataRequest{
-		Addr: s.client.Addr,
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf("error getting metadata: %w", err)
-	}
-	s.logger.V(3).Info(fmt.Sprintf("Listed topics %v", metadata.Topics))
-
-	var groupState string
-	if len(s.metadata.Topic) == 0 {
-		// in case of empty topic name, we will get all topics that the consumer group is subscribed to
-		describeGrpReq := &kafka.DescribeGroupsRequest{
-			Addr: s.client.Addr,
-			GroupIDs: []string{
-				s.metadata.Group,
-			},
-			// TODO: added to make response compabible but does not seem to be helping with the version 3 responce,
-			IncludeAuthorizedOperations: 0,
-		}
-
-		describeGrp, err := s.client.DescribeGroups(ctx, describeGrpReq)
-
-		if err != nil {
-			return nil, groupState, fmt.Errorf("error describing group: %w", err)
-		}
-		if len(describeGrp.Groups[0].Members) == 0 {
-			return nil, groupState, fmt.Errorf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState)
-		}
-		s.logger.V(4).Info(fmt.Sprintf("Described group %s with response %v", s.metadata.Group, describeGrp))
-
-		result := make(map[string][]int)
-
-		topicsInGroup := describeGrp.Groups[0].Members[0].MemberMetadata.Topics
-		groupState = describeGrp.Groups[0].GroupState
-		s.logger.V(1).Info(fmt.Sprintf("Consumer Group %s is in state %s", s.metadata.Group, groupState))
-
-		for _, topic := range metadata.Topics {
-			partitions := make([]int, 0)
-			if kedautil.Contains(topicsInGroup, topic.Name) {
-				s.logger.V(4).Info(fmt.Sprintf("topic name found in froup: %s", topic.Name))
-
-				for _, partition := range topic.Partitions {
-					// if no partitions limitatitions are specified, all partitions are considered
-					if (len(s.metadata.PartitionLimitation) == 0) ||
-						(len(s.metadata.PartitionLimitation) > 0 && kedautil.Contains(s.metadata.PartitionLimitation, partition.ID)) {
-						partitions = append(partitions, partition.ID)
-					}
-				}
-			}
-			result[topic.Name] = partitions
-		}
-		return result, groupState, nil
-	}
-
-	// TODO refactor this, support group state with topic option, not used today, but should be fixed
-	result := make(map[string][]int)
-	for _, topic := range metadata.Topics {
-		partitions := make([]int, 0)
-		if kedautil.Contains(s.metadata.Topic, topic.Name) {
-			for _, partition := range topic.Partitions {
-				if (len(s.metadata.PartitionLimitation) == 0) ||
-					(len(s.metadata.PartitionLimitation) > 0 && kedautil.Contains(s.metadata.PartitionLimitation, partition.ID)) {
-					partitions = append(partitions, partition.ID)
-				}
-			}
-		}
-		result[topic.Name] = partitions
-	}
-	return result, groupState, nil
-}
-
-func (s *apacheKafkaScaler) getConsumerOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, error) {
-	response, err := s.client.OffsetFetch(
-		ctx,
-		&kafka.OffsetFetchRequest{
-			GroupID: s.metadata.Group,
-			Topics:  topicPartitions,
-		},
-	)
-	if err != nil || response.Error != nil {
-		return nil, fmt.Errorf("error listing consumer group offset: %w", err)
-	}
-	consumerOffset := make(map[string]map[int]int64)
-	for topic, partitionsOffset := range response.Topics {
-		consumerOffset[topic] = make(map[int]int64)
-		for _, partition := range partitionsOffset {
-			consumerOffset[topic][partition.Partition] = partition.CommittedOffset
-		}
-	}
-	return consumerOffset, nil
-}
-
-// getProducerOffsets returns the latest offsets for the given topic partitions
-func (s *apacheKafkaScaler) getProducerOffsets(ctx context.Context, topicPartitions map[string][]int) (map[string]map[int]int64, error) {
-	// Step 1: build one OffsetRequest
-	offsetRequest := make(map[string][]kafka.OffsetRequest)
-
-	for topic, partitions := range topicPartitions {
-		for _, partitionID := range partitions {
-			offsetRequest[topic] = append(offsetRequest[topic], kafka.FirstOffsetOf(partitionID), kafka.LastOffsetOf(partitionID))
-		}
-	}
-
-	// Step 2: send request
-	res, err := s.client.ListOffsets(ctx, &kafka.ListOffsetsRequest{
-		Addr:   s.client.Addr,
-		Topics: offsetRequest,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Step 3: parse response and return
-	producerOffsets := make(map[string]map[int]int64)
-	for topic, partitionOffset := range res.Topics {
-		producerOffsets[topic] = make(map[int]int64)
-		for _, partition := range partitionOffset {
-			producerOffsets[topic][partition.Partition] = partition.LastOffset
-		}
-	}
-
-	return producerOffsets, nil
-}
 
 
 func (s *apacheKafkaScaler) getLagForPartition(topic string, partitionID int, consumerOffsets map[string]map[int]int64, producerOffsets map[string]map[int]int64) (int64, int64, error) {
