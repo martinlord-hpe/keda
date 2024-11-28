@@ -379,11 +379,15 @@ func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger
 func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	s.logger.V(0).Info("GetMetricsAndActivity")
 	metricVal, err := s.getMetricForHPA(ctx)
+
 	if err != nil {
-		s.logger.V(0).Info(fmt.Sprintf("GetMetricsAndActivity err %s", err))
-		return []external_metrics.ExternalMetricValue{}, false, err
+		// log the reason of the failed metric calculation, do not return the error to Keda.
+		s.logger.V(0).Info(fmt.Sprintf("HPA final, Metric = TARGET, no mesurement due to  %s", err))
 	}
+
+	// on errors, getMetricForHPA returns metric = TARGET
 	metric := GenerateMetricInMili(metricName, metricVal)
+	// TODO: scaler never returns activity = false.  This causes Keda/HPA to scale back to minimum replicase
 	return []external_metrics.ExternalMetricValue{metric}, true, nil
 }
 
