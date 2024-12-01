@@ -507,7 +507,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 		return scaleFactor, scaleUpTargetMet, nil
 	}
 
-	// update lagRatio Threshold counts for all topics
+	// update lagRatio consecutive threshold counts for all topics
 	for name, topicMetrics := range s.topicMetrics {
 		if topicMetrics.lagRatio > s.metadata.LagRatio {
 			s.aboveThresholdCount[name]++
@@ -516,7 +516,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 		}
 	}
 
-	// check if we meet MesurementsForScale, and select the most relevant topic for later scale dowwn
+	// check if we meet MesurementsForScale, and select the most relevant topic for later scale dowwn (largest throughput)
 	for name, cnt := range s.aboveThresholdCount {
 		if scaleUpOnMultipleTopic {
 			// not implemented yet
@@ -539,7 +539,6 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 
 		scaleUpTargetMet = true // target is met, may or many not scale up
 		s.topicNameLastScaleUp = topicName
-		s.aboveThresholdCount[topicName]++
 		tmetrics := s.topicMetrics[topicName]
 		// Reads and writes are close, minimum scale factor up.
 		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, writesToReadTolerance) {
@@ -552,8 +551,8 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 
 			// internal rates in mgs/ms.   minReadRateToUseForReplicasCount is the minimum read rate
 			// necessary to use writes to read ratio.  To low values can cause excessive scaling up
-			if tmetrics.readRate*1000 >= minReadRateToUseForReplicasCount {
-				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate*writesToReadRatioDampening, hpaMetricFactorMinimumScaleFactor)
+			if tmetrics.readRate * 1000 >= minReadRateToUseForReplicasCount {
+				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate * writesToReadRatioDampening, hpaMetricFactorMinimumScaleFactor)
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Using Write/s to Read/s scale factor %.3f for scale up for topic %s", scaleFactor, topicName))
 
 			} else {
