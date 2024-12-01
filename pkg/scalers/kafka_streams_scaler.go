@@ -124,21 +124,20 @@ type kafkaStreamsScaler struct {
 const (
 	noPartitionOffset = int64(-1)
 	// default Values for trigger parameters
-	defaultLagRatio                  = 3.0
-	defaultCommitInterval            = 30000 // milliseconds, default commit interval in Java Kafka streaming library.
-	defaultMinPartitionWriteThrouput = 0.5   // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
-	defaultMeasurementsForScale      = 3     // number of polling intervals where conditions for scale up/down are met before action
-	defaultScaleDownFactor           = 0.75  //
-	defaultAllowIdleConsumers        = false // by default, do not create more replicas than the number of partitions on the topic with most partitions in the consumerGroup.
-	defaultLimitToPartitionsWithLag  = true  // when true, average lagratio at the topic level ignoring partitions with no writes.
-
+	defaultLagRatio                          = 3.0
+	defaultCommitInterval                    = 30000 // milliseconds, default commit interval in Java Kafka streaming library.
+	defaultMinPartitionWriteThrouput         = 0.5   // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
+	defaultMeasurementsForScale              = 3     // number of polling intervals where conditions for scale up/down are met before action
+	defaultScaleDownFactor                   = 0.75  //
+	defaultAllowIdleConsumers                = false // by default, do not create more replicas than the number of partitions on the topic with most partitions in the consumerGroup.
+	defaultLimitToPartitionsWithLag          = true  // when true, average lagratio at the topic level ignoring partitions with no writes.
+	defaultAllowedTimeLagCatchUp             = 600   // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
+	defaultWritesToReadTolerance             = 10    // Tolerance to decide if reads and writes are 'close' one another, in percentage
+	defaultWritesToReadRatioDampening        = 0.66  // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
+	defaultMinReadRateToUseForReplicasCount  = 10    // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
+	defaultHPAMetricFactorMinimumScaleFactor = 1.11  // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
 	// Not configuratble (yet) default parameters for scaling decision.
-	minReadRateToUseForReplicasCount  = 10
-	hpaMetricFactorMinimumScaleFactor = 1.11  // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
-	writesToReadTolerance             = 10    // Tolerance to decide if reads and writes are 'close' one another
-	writesToReadRatioDampening        = 0.66  // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
-	allowedTimeLagCatchUp             = 600   // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
-	scaleUpOnMultipleTopic            = false // When true (not implemented!), scale on any combination of topic meeting threshold after  MeasurementsForScale
+	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
 )
 
 type kafkaStreamsMetadata struct {
@@ -148,13 +147,18 @@ type kafkaStreamsMetadata struct {
 	// Optional Metadata with no default values
 	Topic []string
 	// Optional Metadata with default values
-	LagRatio                  float64
-	CommitInterval            int64
-	MinPartitionWriteThrouput float64
-	MeasurementsForScale      int64
-	ScaleDownFactor           float64
-	AllowIdleConsumers        bool
-	LimitToPartitionsWithLag  bool
+	LagRatio                          float64
+	CommitInterval                    int64
+	MinPartitionWriteThrouput         float64
+	MeasurementsForScale              int64
+	ScaleDownFactor                   float64
+	AllowIdleConsumers                bool
+	LimitToPartitionsWithLag          bool
+	AllowedTimeLagCatchUp             int64
+	WritesToReadTolerance             int64
+	WritesToReadRatioDampening        float64
+	MinReadRateToUseForReplicasCount  int64
+	HPAMetricFactorMinimumScaleFactor float64
 
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
@@ -208,7 +212,7 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	// Optional parameters with a default value
 	if val, ok := config.TriggerMetadata["lagRatio"]; ok {
 		lagRatio, err := strconv.ParseFloat(val, 64)
-		if err != nil || lagRatio <= 0.0 {
+		if err != nil || lagRatio <= 1.0 {
 			return nil, fmt.Errorf("lagRatio must be a float greater than 1.0")
 		}
 		meta.LagRatio = lagRatio
@@ -218,14 +222,13 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 
 	if val, ok := config.TriggerMetadata["commitInterval"]; ok {
 		commitInterval, err := strconv.ParseInt(val, 10, 64)
-		if err != nil || float64(commitInterval) <= 0 {
+		if err != nil || commitInterval <= 0 {
 			return nil, fmt.Errorf("commitInterval must be an integer in milliseconds greater than 0")
 		}
 		meta.CommitInterval = commitInterval
 	} else {
 		meta.CommitInterval = defaultCommitInterval
 	}
-
 	if val, ok := config.TriggerMetadata["minPartitionWriteThrouput"]; ok {
 		minThroughput, err := strconv.ParseFloat(val, 64)
 		if err != nil || minThroughput <= 0.0 {
@@ -253,7 +256,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.ScaleDownFactor = defaultScaleDownFactor
 	}
-
 	if val, ok := config.TriggerMetadata["allowIdleConsumers"]; ok {
 		idle, err := strconv.ParseBool(val)
 		if err != nil {
@@ -263,7 +265,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.AllowIdleConsumers = defaultAllowIdleConsumers
 	}
-
 	if val, ok := config.TriggerMetadata["limitToPartitionsWithLag"]; ok {
 		lagOnly, err := strconv.ParseBool(val)
 		if err != nil {
@@ -272,6 +273,51 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		meta.LimitToPartitionsWithLag = lagOnly
 	} else {
 		meta.LimitToPartitionsWithLag = defaultLimitToPartitionsWithLag
+	}
+	if val, ok := config.TriggerMetadata["allowedTimeLagCatchUp"]; ok {
+		lagTime, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || lagTime <= 0 {
+			return nil, fmt.Errorf("allowedTimeLagCatchUp must be a inteter number in seconds greater than 0")
+		}
+		meta.AllowedTimeLagCatchUp = lagTime
+	} else {
+		meta.AllowedTimeLagCatchUp = defaultAllowedTimeLagCatchUp
+	}
+	if val, ok := config.TriggerMetadata["writesToReadTolerance"]; ok {
+		wt, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || wt < 0 || wt > 100 {
+			return nil, fmt.Errorf("writesToReadTolerance must be a inteter percentage value between 0 and 100")
+		}
+		meta.WritesToReadTolerance = wt
+	} else {
+		meta.WritesToReadTolerance = defaultWritesToReadTolerance
+	}
+	if val, ok := config.TriggerMetadata["writesToReadRatioDampening"]; ok {
+		wtrr, err := strconv.ParseFloat(val, 64)
+		if err != nil || wtrr <= 0.0 || wtrr >= 1.0 {
+			return nil, fmt.Errorf("writesToReadRatioDampening must be a float number between 0 and 1.0")
+		}
+		meta.WritesToReadRatioDampening = wtrr
+	} else {
+		meta.WritesToReadRatioDampening = defaultWritesToReadRatioDampening
+	}
+	if val, ok := config.TriggerMetadata["minReadRateToUseForReplicasCount"]; ok {
+		mrt, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || mrt < 0 {
+			return nil, fmt.Errorf("minReadRateToUseForReplicasCount must be a inteter greater than 0")
+		}
+		meta.MinReadRateToUseForReplicasCount = mrt
+	} else {
+		meta.MinReadRateToUseForReplicasCount = defaultMinReadRateToUseForReplicasCount
+	}
+	if val, ok := config.TriggerMetadata["hpaMetricFactorMinimumScaleFactor"]; ok {
+		hpaMin, err := strconv.ParseFloat(val, 64)
+		if err != nil || hpaMin < 1.0 {
+			return nil, fmt.Errorf("hpaMetricFactorMinimumScaleFactor must be a float number greater or equal to 1.0")
+		}
+		meta.HPAMetricFactorMinimumScaleFactor = hpaMin
+	} else {
+		meta.HPAMetricFactorMinimumScaleFactor = defaultHPAMetricFactorMinimumScaleFactor
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
@@ -541,9 +587,9 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 		s.topicNameLastScaleUp = topicName
 		tmetrics := s.topicMetrics[topicName]
 		// Reads and writes are close, minimum scale factor up.
-		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, writesToReadTolerance) {
-			scaleFactor = hpaMetricFactorMinimumScaleFactor
-			s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s and Write/s in %d percent range for topic %s, minimum scaling", writesToReadTolerance, topicName))
+		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)) {
+			scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
+			s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s and Write/s in %d percent range for topic %s, minimum scaling", s.metadata.WritesToReadTolerance, topicName))
 		} else if tmetrics.writeRate > tmetrics.readRate {
 			// writes can be much higher than reads in situations like initial kafka throughput load is applied suddently
 			// or when the consumer group is initially deployed and get min replicas.  A higher metric
@@ -551,12 +597,12 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 
 			// internal rates in mgs/ms.   minReadRateToUseForReplicasCount is the minimum read rate
 			// necessary to use writes to read ratio.  To low values can cause excessive scaling up
-			if tmetrics.readRate * 1000 >= minReadRateToUseForReplicasCount {
-				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate * writesToReadRatioDampening, hpaMetricFactorMinimumScaleFactor)
+			if tmetrics.readRate*1000 >= float64(s.metadata.MinReadRateToUseForReplicasCount) {
+				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate*s.metadata.WritesToReadRatioDampening, s.metadata.HPAMetricFactorMinimumScaleFactor)
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Using Write/s to Read/s scale factor %.3f for scale up for topic %s", scaleFactor, topicName))
 
 			} else {
-				scaleFactor = hpaMetricFactorMinimumScaleFactor
+				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s %.3f to low to estimate Write/s to Read/s for scale up for topic %s, minimum scaling", tmetrics.readRate*1000, topicName))
 			}
 		} else {
@@ -564,12 +610,12 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 			// if we should just wait or scale up a notch to catch up faster.
 			realLag := tmetrics.lag - tmetrics.residualLag
 			lagTimeToNomimal := float64(realLag) / ((tmetrics.readRate * 1000) - (tmetrics.writeRate * 1000))
-			if int64(lagTimeToNomimal) > allowedTimeLagCatchUp {
-				scaleFactor = hpaMetricFactorMinimumScaleFactor
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %ds greater than %ds, minimum scale up for topic %s", int64(lagTimeToNomimal), allowedTimeLagCatchUp, topicName))
+			if int64(lagTimeToNomimal) > s.metadata.AllowedTimeLagCatchUp {
+				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %ds greater than %ds, minimum scale up for topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
 			} else {
 				scaleFactor = 1.0
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %d lower than %ds, not scaling up topic %s", int64(lagTimeToNomimal), allowedTimeLagCatchUp, topicName))
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %d lower than %ds, not scaling up topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
 			}
 		}
 		// important, after scaling action decision, restart measurement counts for next scaling action
