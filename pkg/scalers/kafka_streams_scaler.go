@@ -90,6 +90,7 @@ type kafkaStreamsScaler struct {
 	topicMetrics            map[string]kafkaTopicMetrics // Calculated metrics for each topic used for scaling decisions
 	aboveThresholdCount     map[string]int64             // tracks number of consecutive polling periods lagRatio is met for 'MeasurementsForScale'
 	lastGroupState          string                       // most current consumer group state
+	lastGroupMembersCnt     int64                        // the number of members in the consumer group
 	topicNameLastScaleUp    string                       // Store the name of the last topic for which metrics caused a scale up
 	// Just statistic
 	// pollingStableCount    int64
@@ -121,21 +122,31 @@ type kafkaStreamsScaler struct {
 
 */
 
+type LimitScaleUp int
+
+const (
+	noLimit LimitScaleUp = iota
+	topicLimit
+	groupLimit
+)
+
 const (
 	noPartitionOffset = int64(-1)
 	// default Values for trigger parameters
 	defaultLagRatio                          = 3.0
-	defaultCommitInterval                    = 30000 // milliseconds, default commit interval in Java Kafka streaming library.
-	defaultMinPartitionWriteThrouput         = 0.5   // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
-	defaultMeasurementsForScale              = 3     // number of polling intervals where conditions for scale up/down are met before action
-	defaultScaleDownFactor                   = 0.75  //
-	defaultAllowIdleConsumers                = false // by default, do not create more replicas than the number of partitions on the topic with most partitions in the consumerGroup.
-	defaultLimitToPartitionsWithLag          = true  // when true, average lagratio at the topic level ignoring partitions with no writes.
-	defaultAllowedTimeLagCatchUp             = 600   // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
-	defaultWritesToReadTolerance             = 10    // Tolerance to decide if reads and writes are 'close' one another, in percentage
-	defaultWritesToReadRatioDampening        = 0.66  // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
-	defaultMinReadRateToUseForReplicasCount  = 10    // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
-	defaultHPAMetricFactorMinimumScaleFactor = 1.11  // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
+	defaultCommitInterval                    = 30000      // milliseconds, default commit interval in Java Kafka streaming library.
+	defaultMinPartitionWriteThrouput         = 0.5        // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
+	defaultMeasurementsForScale              = 3          // number of polling intervals where conditions for scale up/down are met before action
+	defaultScaleDownFactor                   = 0.75       //
+	defaultAllowIdleConsumers                = false      // by default, do not create more replicas than the number of partitions on the topic with most partitions in the consumerGroup.
+	defaultLimitToPartitionsWithLag          = true       // when true, average lagratio at the topic level ignoring partitions with no writes.
+	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
+	defaultWritesToReadTolerance             = 10         // Tolerance to decide if reads and writes are 'close' one another, in percentage
+	defaultWritesToReadRatioDampening        = 0.66       // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
+	defaultMinReadRateToUseForReplicasCount  = 10         // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
+	defaultHPAMetricFactorMinimumScaleFactor = 1.11       // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
+	defaultLimitScaleUp                      = groupLimit // Limit scaling if group Members would exceed partitions: "group" -> topic with max partitions, "topic" -> topic causing scaling up, "none"
+
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
 )
@@ -152,13 +163,14 @@ type kafkaStreamsMetadata struct {
 	MinPartitionWriteThrouput         float64
 	MeasurementsForScale              int64
 	ScaleDownFactor                   float64
-	AllowIdleConsumers                bool
+	AllowIdleConsumers                bool // TODO remove this.
 	LimitToPartitionsWithLag          bool
 	AllowedTimeLagCatchUp             int64
 	WritesToReadTolerance             int64
 	WritesToReadRatioDampening        float64
 	MinReadRateToUseForReplicasCount  int64
 	HPAMetricFactorMinimumScaleFactor float64
+	LimitScaleUp                      LimitScaleUp
 
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
@@ -318,6 +330,20 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		meta.HPAMetricFactorMinimumScaleFactor = hpaMin
 	} else {
 		meta.HPAMetricFactorMinimumScaleFactor = defaultHPAMetricFactorMinimumScaleFactor
+	}
+	if val, ok := config.TriggerMetadata["limitScaleUp"]; ok {
+		switch val {
+		case "none":
+			meta.LimitScaleUp = noLimit
+		case "topic":
+			meta.LimitScaleUp = topicLimit
+		case "group":
+			meta.LimitScaleUp = groupLimit
+		default:
+			return nil, fmt.Errorf("limitScaleUp must be one of \"none\", \"topic\", \"group\"")
+		}
+	} else {
+		meta.LimitScaleUp = defaultLimitScaleUp
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
@@ -586,6 +612,33 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 		scaleUpTargetMet = true // target is met, may or many not scale up
 		s.topicNameLastScaleUp = topicName
 		tmetrics := s.topicMetrics[topicName]
+
+		// This part will skip scaling up if the number of members would become greater than the partition count (3 config options)
+		partitions := int64(0)
+		switch s.metadata.LimitScaleUp {
+		case groupLimit:
+			for _, tm := range s.topicMetrics {
+				if tm.partitionsTotal > partitions {
+					partitions = tm.partitionsTotal
+				}
+			}
+		case topicLimit:
+			if s.lastGroupMembersCnt >= tmetrics.partitionsTotal {
+				// topic that would cause scaling up already has as many members as paritions
+				partitions = tmetrics.partitionsTotal
+			}
+		case noLimit:
+			partitions = math.MaxInt64
+		default:
+			return scaleFactor, scaleUpTargetMet, fmt.Errorf("unexpected value for limitScaleUp found in scale up decision")
+		}
+		if s.lastGroupMembersCnt >= partitions {
+			s.logger.V(0).Info(fmt.Sprintf("HPA Metric: not scaling up, group already has one member for each patition (%d)", s.lastGroupMembersCnt))
+			scaleFactor = 1.0
+			s.resetScalingMeasurementsCount()
+			return scaleFactor, scaleUpTargetMet, nil
+		}
+
 		// Reads and writes are close, minimum scale factor up.
 		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)) {
 			scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
@@ -600,7 +653,6 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error
 			if tmetrics.readRate*1000 >= float64(s.metadata.MinReadRateToUseForReplicasCount) {
 				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate*s.metadata.WritesToReadRatioDampening, s.metadata.HPAMetricFactorMinimumScaleFactor)
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Using Write/s to Read/s scale factor %.3f for scale up for topic %s", scaleFactor, topicName))
-
 			} else {
 				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s %.3f to low to estimate Write/s to Read/s for scale up for topic %s, minimum scaling", tmetrics.readRate*1000, topicName))
@@ -633,12 +685,13 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (float64, bool, err
 }
 
 func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) error {
-	topicPartitions, groupState, err := s.getTopicPartitions(ctx)
+	topicPartitions, groupState, groupMembers, err := s.getTopicPartitions(ctx)
 	if err != nil {
 		return err
 	}
 	s.lastGroupState = groupState
-	s.logger.V(1).Info(fmt.Sprintf("Group %s, state: %s: number of topics: %d ", s.metadata.Group, groupState, len(topicPartitions)))
+	s.lastGroupMembersCnt = groupMembers
+	s.logger.V(0).Info(fmt.Sprintf("Group %s, state: %s: number of topics: %d, number of members: %d", s.metadata.Group, groupState, len(topicPartitions), groupMembers))
 
 	consumerOffsets, producerOffsets, err := s.getAllOffsets(ctx, topicPartitions)
 	s.logger.V(2).Info(fmt.Sprintf("Group %s, Consumer offsets %v, producer offsets %v", s.metadata.Group, consumerOffsets, producerOffsets))
@@ -691,7 +744,7 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 	return nil
 }
 
-func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string][]int, string, error) {
+func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string][]int, string, int64, error) {
 	// Step 1 - get consumer group state and list of topics in the group
 	describeGrpReq := &kafka.DescribeGroupsRequest{
 		Addr: s.client.Addr,
@@ -704,14 +757,16 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 	// call to the broker
 	describeGrp, err := s.client.DescribeGroups(ctx, describeGrpReq)
 	if err != nil {
-		return nil, "", fmt.Errorf("error describing group: %w", err)
+		return nil, "", 0, fmt.Errorf("error describing group: %w", err)
 	}
 	if len(describeGrp.Groups[0].Members) == 0 {
-		return nil, "", fmt.Errorf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState)
+		return nil, "", 0, fmt.Errorf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState)
 	}
 	// Requesting a single group, expecting a single response
 	groupState := describeGrp.Groups[0].GroupState
 	s.logger.V(2).Info(fmt.Sprintf("Consumer Group %s is in state %s", s.metadata.Group, groupState))
+	groupMembersCnt := int64(len(describeGrp.Groups[0].Members))
+	s.logger.V(0).Info(fmt.Sprintf("Consumer Group %s has %d members", s.metadata.Group, groupMembersCnt))
 
 	// This is sufficient in normal conditions:
 	//      describeGrp.Groups[0].Members[0].MemberMetadata.Topics
@@ -732,7 +787,7 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 	// Calling the Metadata API with empty topics returns all of the paritions for all of the topics
 	// on the cluster, lots of data on a large cluster
 	if len(topics) == 0 {
-		return nil, groupState, fmt.Errorf("no topic currently assigned to the group: %s in state %s", s.metadata.Group, groupState)
+		return nil, groupState, groupMembersCnt, fmt.Errorf("no topic currently assigned to the group: %s in state %s", s.metadata.Group, groupState)
 	}
 	s.logger.V(2).Info(fmt.Sprintf("Found Topics in Group %s is in state %s", topics, s.metadata.Group))
 
@@ -743,7 +798,7 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 		Topics: topics,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("error getting topics paritions info: %w", err)
+		return nil, "", 0, fmt.Errorf("error getting topics paritions info: %w", err)
 	}
 
 	result := make(map[string][]int)
@@ -759,7 +814,7 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 		}
 		result[topic.Name] = partitions
 	}
-	return result, groupState, nil
+	return result, groupState, groupMembersCnt, nil
 }
 
 // Fetch last and committed offsets from broker(s), call the 2 APIs required in threds.
