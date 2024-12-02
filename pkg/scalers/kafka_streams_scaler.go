@@ -138,7 +138,6 @@ const (
 	defaultMinPartitionWriteThrouput         = 0.5        // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
 	defaultMeasurementsForScale              = 3          // number of polling intervals where conditions for scale up/down are met before action
 	defaultScaleDownFactor                   = 0.75       //
-	defaultAllowIdleConsumers                = false      // by default, do not create more replicas than the number of partitions on the topic with most partitions in the consumerGroup.
 	defaultLimitToPartitionsWithLag          = true       // when true, average lagratio at the topic level ignoring partitions with no writes.
 	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
 	defaultWritesToReadTolerance             = 10         // Tolerance to decide if reads and writes are 'close' one another, in percentage
@@ -163,7 +162,6 @@ type kafkaStreamsMetadata struct {
 	MinPartitionWriteThrouput         float64
 	MeasurementsForScale              int64
 	ScaleDownFactor                   float64
-	AllowIdleConsumers                bool // TODO remove this.
 	LimitToPartitionsWithLag          bool
 	AllowedTimeLagCatchUp             int64
 	WritesToReadTolerance             int64
@@ -267,15 +265,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		meta.ScaleDownFactor = scaleDown
 	} else {
 		meta.ScaleDownFactor = defaultScaleDownFactor
-	}
-	if val, ok := config.TriggerMetadata["allowIdleConsumers"]; ok {
-		idle, err := strconv.ParseBool(val)
-		if err != nil {
-			return nil, fmt.Errorf("allowIdleConsumers must be \"true\" or \"false\"")
-		}
-		meta.AllowIdleConsumers = idle
-	} else {
-		meta.AllowIdleConsumers = defaultAllowIdleConsumers
 	}
 	if val, ok := config.TriggerMetadata["limitToPartitionsWithLag"]; ok {
 		lagOnly, err := strconv.ParseBool(val)
