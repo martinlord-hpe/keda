@@ -530,7 +530,9 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	met := s.topicMetrics[topicInfoForLog]
 	s.logger.V(0).Info(fmt.Sprintf("Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, group: %s on topic: %s",
 		hpaMetric*factor, s.groupState, met.lagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.lag, met.residualLag, met.writeRate*1000, met.readRate*1000, s.metadata.Group, topicInfoForLog))
-
+	if s.lastScaleUpMetrics != nil {
+		s.logger.V(0).Info(fmt.Sprintf("Final Metric: last scale up topic: %s, write/s: %f", s.lastScaleUpTopicName, s.lastScaleUpMetrics.writeRate*1000))
+	}
 	return hpaMetric * factor, nil
 }
 
@@ -555,9 +557,9 @@ func (s *kafkaStreamsScaler) resetScalingMeasurementsCount() {
  desiredReplicas DOES NOT direclty becomes HPA 'desired replicas count', it HPA policies contribute.
 */
 
-func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (float64, bool, error) {
-	scaleFactor := 1.0
-	scaleUpTargetMet := false
+func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64, scaleUpTargetMet bool, err error) {
+	scaleFactor = 1.0
+	scaleUpTargetMet = false
 	// name of the most relevant topic in the consumer group when reaching a scaling decision point
 	topicName := ""
 	topicWrites := 0.0
@@ -682,12 +684,12 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (float64, bool, err
 		return scaleFactor, scaleDownTargetMet, nil
 	}
 
-	// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and 
+	// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and
 	// and write throughput is down by configured factor.
-	if tmetrics.readRate > 0.0 && tmetrics.writeRate > 0.0 && tmetrics.writeRate < s.lastScaleUpMetrics.writeRate * s.metadata.ScaleDownFactor {
+	if tmetrics.readRate > 0.0 && tmetrics.writeRate > 0.0 && tmetrics.writeRate < s.lastScaleUpMetrics.writeRate*s.metadata.ScaleDownFactor {
 		// Additional precaution, do not scale down if write rate is threatening to get higher than reads
-		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)) || 
-			tmetrics.writeRate * float64(s.metadata.WritesToReadTolerance) < tmetrics.readRate {
+		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)) ||
+			tmetrics.writeRate*float64(s.metadata.WritesToReadTolerance) < tmetrics.readRate {
 			s.underThreasholdCount++
 		} else {
 			s.underThreasholdCount = 0
