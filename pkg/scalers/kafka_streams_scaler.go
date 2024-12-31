@@ -146,7 +146,7 @@ const (
 	defaultScaleDownFactor                   = 0.75       // How much write rates to topic have to come down from last scale up to initiate downscale,
 	defaultLimitToPartitionsWithLag          = true       // when true, average lagratio at the topic level ignoring partitions with no writes.
 	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
-	defaultWritesToReadTolerance             = 10         // Tolerance to decide if reads and writes are 'close' one another, in percentage
+	defaultWritesToReadTolerance             = 20         // Tolerance to decide if reads and writes are 'close' one another, in percentage
 	defaultWritesToReadRatioDampening        = 0.66       // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
 	defaultMinReadRateToUseForReplicasCount  = 10         // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
 	defaultHPAMetricFactorMinimumScaleFactor = 1.11       // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
@@ -691,9 +691,8 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 	return scaleFactor, scaleUpTargetMet, nil
 }
 
-func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (float64, bool, error) {
-	scaleFactor := 1.0
-	scaleDownTargetMet := false
+func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float64, scaleDownTargetMet bool, err error) {
+	scaleFactor = 1.0
 
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
 		// no baseline
@@ -709,15 +708,22 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (float64, bool, err
 	// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and
 	// and write throughput is down by configured factor.
 	if tmetrics.readRate > 0.0 && tmetrics.writeRate > 0.0 && tmetrics.writeRate < s.lastScaleUpMetrics.writeRate*s.metadata.ScaleDownFactor {
-		// Additional precaution, do not scale down if write rate is threatening to get higher than reads
-		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)) ||
-			tmetrics.writeRate*float64(s.metadata.WritesToReadTolerance) < tmetrics.readRate {
+		switch {
+		// reads and writes are close, go ahead with scale down
+		case withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)):
 			s.underThreasholdCount++
-		} else {
-			s.underThreasholdCount = 0
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
+				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance))
+		default:
+			// TODDO: needs more battle testing.
+			s.underThreasholdCount++
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s no close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
+				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance))
 		}
 	} else {
 		s.underThreasholdCount = 0
+		s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
+			tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance))
 	}
 
 	if s.underThreasholdCount >= s.metadata.MeasurementsForScale {
