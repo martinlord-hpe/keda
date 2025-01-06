@@ -23,25 +23,23 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
 	"time"
 
-	"math"
-	"strings"
-
-	"strconv"
-
 	"github.com/go-logr/logr"
+	awsutils "github.com/kedacore/keda/v2/pkg/scalers/aws"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
+	kedautil "github.com/kedacore/keda/v2/pkg/util"
+	v2 "k8s.io/api/autoscaling/v2"
+	"k8s.io/metrics/pkg/apis/external_metrics"
+
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl"
 	"github.com/segmentio/kafka-go/sasl/aws_msk_iam_v2"
 	"github.com/segmentio/kafka-go/sasl/plain"
 	"github.com/segmentio/kafka-go/sasl/scram"
-	v2 "k8s.io/api/autoscaling/v2"
-	"k8s.io/metrics/pkg/apis/external_metrics"
-
-	awsutils "github.com/kedacore/keda/v2/pkg/scalers/aws"
-	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
-	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 /*
@@ -90,16 +88,16 @@ type kafkaStreamsScaler struct {
 	previousLastOffsets     map[string]map[int]int64     // last offsets for all the topics and topic parttions in last poll
 	lastOffetsTime          int64                        // timestamp where all those offsets were updated
 	topicMetrics            map[string]kafkaTopicMetrics // Calculated metrics for each topic used for scaling decisions
-	writesRollingAvg        map[string]float64           // Approximate rolling avg
-	aboveThresholdCount     map[string]int64             // tracks number of consecutive polling periods lagRatio is met for 'MeasurementsForScale'
-	underThreasholdCount    int64                        //
-	groupState              string                       // most current consumer group state
-	groupMembersCount       int64                        // the number of members in the consumer group
-	groupHosts              int64                        // the number of hpsts in the consumer group
+	writesRollingAvg        map[string]float64           // Approximate write/s rolling avg
+	aboveThresholdCount     map[string]int64             // Consecutive polling periods where lagRatio is met for 'MeasurementsForScale' for scale up
+	underThreasholdCount    int64                        //C onsecutive polling periods where lagRatio is met for 'MeasurementsForScale' for scale down
+	groupState              string                       // last poll consumer group state
+	groupMembersCount       int64                        // Number of members in the consumer group
+	groupHosts              int64                        // Number of hpsts in the consumer group
 	lastScaleUpTopicName    string                       // Store the name of the last topic for which metrics caused a scale up
 	lastScaleUpMetrics      *kafkaTopicMetrics           // Store metrics of the last topic that casued scale up
-	pollingCount            int64                        // number of times the getMetricsAndActivity() API was called by keda.
-	pollingStableCount      int64
+	pollingCount            int64                        // Times the getMetricsAndActivity() API was called by keda.
+	pollingStableCount      int64                        // Times the getMetricsAndActivity() API was called by keda and a metric could be calculated
 }
 
 /*
@@ -135,18 +133,17 @@ const (
 	groupLimit
 )
 
-// TODO: defaultScaleDownFactor gets dicey when numbers of members in consumer group is low, might be able to improve using hosts.
 const (
 	noPartitionOffset = int64(-1)
 	// default Values for trigger parameters
-	defaultLagRatio                          = 3.0
+	defaultLagRatio                          = 3.0        // no unit
 	defaultCommitInterval                    = 30000      // milliseconds, default commit interval in Java Kafka streaming library.
 	defaultMinPartitionWriteThrouput         = 0.5        // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
-	defaultMeasurementsForScale              = 3          // number of polling intervals where conditions for scale up/down are met before action
-	defaultScaleDownFactor                   = 0.75       // How much write rates to topic have to come down from last scale up to initiate downscale,
+	defaultMeasurementsForScale              = 3          // number of polling intervals where conditions for scale up/down are met before scaling action
+	defaultScaleDownFactor                   = 0.60       // How much write rates to topic have to come down from last scale up to initiate downscale,
 	defaultLimitToPartitionsWithLag          = true       // when true, average lagratio at the topic level ignoring partitions with no writes.
-	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that value in seconds, do not scale up
-	defaultWritesToReadTolerance             = 20         // Tolerance to decide if reads and writes are 'close' one another, in percentage
+	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that time in seconds, do not scale up
+	defaultWritesToReadTolerance             = 25         // Tolerance to decide if reads and writes are 'close' one another, in percentage
 	defaultWritesToReadRatioDampening        = 0.66       // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
 	defaultMinReadRateToUseForReplicasCount  = 10         // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
 	defaultHPAMetricFactorMinimumScaleFactor = 1.11       // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
@@ -496,8 +493,6 @@ func (s *kafkaStreamsScaler) Close(context.Context) error {
 func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, error) {
 	s.pollingCount++ // internal stat
 	hpaMetric := s.metadata.LagRatio
-	s.logger.V(2).Info(fmt.Sprintf("getMetricForHPA: ctx: %+v ", ctx))
-
 	err := s.getAllConsumerGroupMetrics(ctx)
 	if err != nil {
 		return hpaMetric, err
