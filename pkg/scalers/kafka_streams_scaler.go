@@ -592,6 +592,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 	for name, topicMetrics := range s.topicMetrics {
 		if topicMetrics.lagRatio > s.metadata.LagRatio {
 			s.aboveThresholdCount[name]++
+			scaleUpTargetMet = true // target is met, may or many not scale up
 		} else {
 			s.aboveThresholdCount[name] = 0
 		}
@@ -618,7 +619,6 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 			return scaleFactor, scaleUpTargetMet, fmt.Errorf("unexpected error in scale up decision, no topic name")
 		}
 
-		scaleUpTargetMet = true // target is met, may or many not scale up
 		tmetrics := s.topicMetrics[topicName]
 		s.lastScaleUpTopicName = topicName
 		s.lastScaleUpMetrics = &tmetrics
