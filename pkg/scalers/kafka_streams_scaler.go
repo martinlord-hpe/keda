@@ -143,7 +143,7 @@ const (
 	defaultScaleDownFactor                   = 0.60       // How much write rates to topic have to come down from last scale up to initiate downscale,
 	defaultLimitToPartitionsWithLag          = true       // when true, average lagratio at the topic level ignoring partitions with no writes.
 	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that time in seconds, do not scale up
-	defaultWritesToReadTolerance             = 25         // Tolerance to decide if reads and writes are 'close' one another, in percentage
+	defaultWritesToReadTolerance             = 20         // Tolerance to decide if reads and writes are 'close' one another, in percentage
 	defaultWritesToReadRatioDampening        = 0.66       // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
 	defaultMinReadRateToUseForReplicasCount  = 10         // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
 	defaultHPAMetricFactorMinimumScaleFactor = 1.11       // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
@@ -495,10 +495,12 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	hpaMetric := s.metadata.LagRatio
 	err := s.getAllConsumerGroupMetrics(ctx)
 	if err != nil {
+		s.resetScalingMeasurementsCount()
 		return hpaMetric, err
 	}
 	factor, scaleUpTargetMet, err := s.getScaleUpDecisionAndFactor()
 	if err != nil {
+		s.resetScalingMeasurementsCount()
 		return hpaMetric, err
 	}
 
@@ -506,16 +508,35 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	if !scaleUpTargetMet {
 		factor, scaleDownTargetMet, err = s.getScaleDownDecisionAndFactor()
 		if err != nil {
+			s.resetScalingMeasurementsCount()
 			return hpaMetric, err
 		}
 	}
 
-	// Pick a topic, for logging/debugging only,
+	// Pick most relevant topic for logging/debugging only.
 	topicInfoForLog := ""
-	if scaleUpTargetMet || scaleDownTargetMet {
+	switch {
+	case scaleUpTargetMet:
+		a := int64(0)
+		ratio := 0.0
+		for name, cnt := range s.aboveThresholdCount {
+			r := s.topicMetrics[name].lagRatio
+			switch {
+			case cnt > a:
+				a = cnt
+				topicInfoForLog = name
+			case cnt == a:
+				if r >= ratio {
+					ratio = r
+					topicInfoForLog = name
+				}
+			case cnt < a:
+				// nothing
+			}
+		}
+	case scaleDownTargetMet:
 		topicInfoForLog = s.lastScaleUpTopicName
-	} else {
-		// pick highest lag ratio topic
+	default:
 		ratio := 0.0
 		for name, topicMetrics := range s.topicMetrics {
 			if topicMetrics.lagRatio > ratio {
@@ -524,6 +545,7 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 			}
 		}
 	}
+
 	met := s.topicMetrics[topicInfoForLog]
 	s.logger.V(0).Info(fmt.Sprintf("Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, group: %s on topic: %s",
 		hpaMetric*factor, s.groupState, met.lagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.lag, met.residualLag, met.writeRate*1000, met.readRate*1000, s.writesRollingAvg[topicInfoForLog]*1000, s.metadata.Group, topicInfoForLog))
@@ -559,7 +581,7 @@ func (s *kafkaStreamsScaler) updateRollingAvg() {
 		// basic formula for calculating rolling average with just last avg and window size
 		s.writesRollingAvg[name] = (old_avg * (cnt - 1) / cnt) + (s.topicMetrics[name].writeRate / float64(cnt))
 	}
-	s.logger.V(0).Info(fmt.Sprintf("Rolling: %v pool:%d ", s.writesRollingAvg, s.pollingStableCount))
+	s.logger.V(2).Info(fmt.Sprintf("Rolling: %v pool:%d ", s.writesRollingAvg, s.pollingStableCount))
 	s.pollingStableCount++
 }
 
@@ -574,8 +596,7 @@ func (s *kafkaStreamsScaler) updateRollingAvg() {
 func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64, scaleUpTargetMet bool, err error) {
 	scaleFactor = 1.0
 	scaleUpTargetMet = false
-	// name of the most relevant topic in the consumer group when reaching a scaling decision point
-	topicName := ""
+	topicName := "" // name of the most relevant topic in the consumer group when reaching a scaling decision point
 	topicWrites := 0.0
 	scaleUpCount := int64(0)
 
@@ -648,27 +669,9 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 			return scaleFactor, scaleUpTargetMet, nil
 		}
 
-		// Reads and writes are close, minimum scale factor up.
-		if withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)) {
-			scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
-			s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s and Write/s in %d percent range for topic %s, minimum scaling", s.metadata.WritesToReadTolerance, topicName))
-		} else if tmetrics.writeRate > tmetrics.readRate {
-			// writes can be much higher than reads in situations like initial kafka throughput load is applied suddently
-			// or when the consumer group is initially deployed and get min replicas.  A higher metric
-			// will accelerate the convergence to correct replicas
-
-			// internal rates in mgs/ms.   minReadRateToUseForReplicasCount is the minimum read rate
-			// necessary to use writes to read ratio.  To low values can cause excessive scaling up
-			if tmetrics.readRate*1000 >= float64(s.metadata.MinReadRateToUseForReplicasCount) {
-				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate*s.metadata.WritesToReadRatioDampening, s.metadata.HPAMetricFactorMinimumScaleFactor)
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Using Write/s to Read/s scale factor %.3f for scale up for topic %s", scaleFactor, topicName))
-			} else {
-				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s %.3f to low to estimate Write/s to Read/s for scale up for topic %s, minimum scaling", tmetrics.readRate*1000, topicName))
-			}
-		} else {
-			// reads are higher than writes, we have some lag, but are catching up.   This code snippet tries to decide
-			// if we should just wait or scale up a notch to catch up faster.
+		if tmetrics.readRate > (tmetrics.writeRate * float64(100-s.metadata.WritesToReadTolerance) / 100) {
+			// Reads are close to writes or greater
+			// check if we should just wait or scale up a notch to catch up faster.
 			realLag := tmetrics.lag - tmetrics.residualLag
 			lagTimeToNomimal := float64(realLag) / ((tmetrics.readRate * 1000) - (tmetrics.writeRate * 1000))
 			if int64(lagTimeToNomimal) > s.metadata.AllowedTimeLagCatchUp {
@@ -678,8 +681,21 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 				scaleFactor = 1.0
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %d lower than %ds, not scaling up topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
 			}
+		} else {
+			// writes can be much higher than reads in situations like initial kafka throughput load is applied suddently
+			// or when the consumer group is initially deployed and get min replicas.  A higher metric
+			// will accelerate the convergence to correct replicas count
+
+			// internal rates in mgs/ms.   minReadRateToUseForReplicasCount is the minimum read rate
+			// necessary to use writes to read ratio.  Too low values can cause excessive scaling up
+			if tmetrics.readRate*1000 >= float64(s.metadata.MinReadRateToUseForReplicasCount) {
+				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate*s.metadata.WritesToReadRatioDampening, s.metadata.HPAMetricFactorMinimumScaleFactor)
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Using Write/s to Read/s scale factor %.3f for scale up for topic %s", scaleFactor, topicName))
+			} else {
+				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s %.3f to low to estimate Write/s to Read/s for scale up for topic %s, minimum scaling", tmetrics.readRate*1000, topicName))
+			}
 		}
-		// important, after scaling action decision, restart measurement counts for next scaling action
 		s.resetScalingMeasurementsCount()
 	}
 
@@ -740,7 +756,7 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 	s.groupState = groupState
 	s.groupMembersCount = groupMembers
 	s.groupHosts = groupHosts
-	s.logger.V(0).Info(fmt.Sprintf("Group %s, state: %s: number of topics: %d, number of members: %d, number of hosts: %d", s.metadata.Group, groupState, len(topicPartitions), groupMembers, groupHosts))
+	s.logger.V(0).Info(fmt.Sprintf("Group: %s, state: %s: number of topics: %d, number of members: %d, number of hosts: %d", s.metadata.Group, groupState, len(topicPartitions), groupMembers, groupHosts))
 
 	consumerOffsets, producerOffsets, err := s.getAllOffsets(ctx, topicPartitions)
 	s.logger.V(2).Info(fmt.Sprintf("Group %s, Consumer offsets %v, producer offsets %v", s.metadata.Group, consumerOffsets, producerOffsets))
@@ -820,7 +836,7 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 	groupState := describeGrp.Groups[0].GroupState
 	s.logger.V(2).Info(fmt.Sprintf("Consumer Group %s is in state %s", s.metadata.Group, groupState))
 	groupMembersCnt := int64(len(describeGrp.Groups[0].Members))
-	s.logger.V(0).Info(fmt.Sprintf("Consumer Group %s has %d members", s.metadata.Group, groupMembersCnt))
+	s.logger.V(2).Info(fmt.Sprintf("Consumer Group %s has %d members", s.metadata.Group, groupMembersCnt))
 
 	// This is sufficient in normal conditions:
 	//      describeGrp.Groups[0].Members[0].MemberMetadata.Topics
