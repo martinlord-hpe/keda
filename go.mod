@@ -145,6 +145,7 @@ replace (
 	// https://www.whitesourcesoftware.com/vulnerability-database/CVE-2020-26160
 	github.com/dgrijalva/jwt-go => github.com/golang-jwt/jwt/v4 v4.4.0
 	github.com/golang-jwt/jwt/v4 => github.com/golang-jwt/jwt/v4 v4.5.0
+	github.com/segmentio/kafka-go v0.4.47 => ../kafka-go
 
 	// opentelemetry cannot update to 1.25.0 according to the dependencies of google.golang.org/grpc
 	//go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc => go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.24.0
