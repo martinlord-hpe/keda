@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Please note that this is an experimental scaler based on the kafka-go library.
-
 package scalers
 
 import (
@@ -671,15 +669,22 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 
 		if tmetrics.readRate > (tmetrics.writeRate * float64(100-s.metadata.WritesToReadTolerance) / 100) {
 			// Reads are close to writes or greater
-			// check if we should just wait or scale up a notch to catch up faster.
-			realLag := tmetrics.lag - tmetrics.residualLag
-			lagTimeToNomimal := float64(realLag) / ((tmetrics.readRate * 1000) - (tmetrics.writeRate * 1000))
-			if int64(lagTimeToNomimal) > s.metadata.AllowedTimeLagCatchUp {
-				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %ds greater than %ds, minimum scale up for topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
+			if tmetrics.readRate > tmetrics.writeRate {
+				// check if we should just wait or scale up a notch to catch up faster when reads are higher than writes.
+				realLag := tmetrics.lag - tmetrics.residualLag
+				lagTimeToNomimal := float64(realLag) / ((tmetrics.readRate * 1000) - (tmetrics.writeRate * 1000))
+				if int64(lagTimeToNomimal) > s.metadata.AllowedTimeLagCatchUp {
+					scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
+					s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %ds greater than %ds, minimum scale up for topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
+				} else {
+					scaleFactor = 1.0
+					s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag XXX catch up time %d lower than %ds, not scaling up topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
+				}
 			} else {
-				scaleFactor = 1.0
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %d lower than %ds, not scaling up topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
+
+				// write/s are highve than read/s but just but just within writesToReadTolerance)
+				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: read/s < write/s but within ritesToReadTolerance %d%%,  minimum scale up for topic %s", s.metadata.WritesToReadTolerance, topicName))
 			}
 		} else {
 			// writes can be much higher than reads in situations like initial kafka throughput load is applied suddently
@@ -728,7 +733,7 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 		default:
 			// TODDO: needs more battle testing.
 			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s no close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
 				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance))
 		}
 	} else {
