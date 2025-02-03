@@ -146,7 +146,7 @@ const (
 	defaultMinReadRateToUseForReplicasCount  = 10         // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
 	defaultHPAMetricFactorMinimumScaleFactor = 1.11       // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
 	defaultLimitScaleUp                      = groupLimit // Limit scaling if group Members would exceed partitions: "group" -> topic with max partitions, "topic" -> topic causing scaling up, "none"
-
+	defaultMinPartitionsWithLag              = 2          // Do not scale unless the lag is on at least that many parition.
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
 )
@@ -170,6 +170,7 @@ type kafkaStreamsMetadata struct {
 	MinReadRateToUseForReplicasCount  int64
 	HPAMetricFactorMinimumScaleFactor float64
 	LimitScaleUp                      LimitScaleUp
+	MinPartitionsWithLag              int64
 
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
@@ -334,6 +335,15 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		}
 	} else {
 		meta.LimitScaleUp = defaultLimitScaleUp
+	}
+	if val, ok := config.TriggerMetadata["minPartitionsWithLag"]; ok {
+		mrt, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || mrt < 2 {
+			return nil, fmt.Errorf("minPartitionsWithLag must be a inteter greater than 1")
+		}
+		meta.MinPartitionsWithLag = mrt
+	} else {
+		meta.MinPartitionsWithLag = defaultMinPartitionsWithLag
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
@@ -610,8 +620,13 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 	// update lagRatio consecutive threshold counts for all topics
 	for name, topicMetrics := range s.topicMetrics {
 		if topicMetrics.lagRatio > s.metadata.LagRatio {
-			s.aboveThresholdCount[name]++
-			scaleUpTargetMet = true // target is met, may or many not scale up
+			if s.topicMetrics[name].partitionsWithLag >= s.metadata.MinPartitionsWithLag {
+				// Deault config is 2, dont pointlessly scale if lag is on one partition.
+				s.aboveThresholdCount[name]++
+				scaleUpTargetMet = true // target is met, may or many not scale up
+			} else {
+				s.aboveThresholdCount[name] = 0
+			}
 		} else {
 			s.aboveThresholdCount[name] = 0
 		}
