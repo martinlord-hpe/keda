@@ -149,8 +149,10 @@ const (
 	defaultLimitScaleUp                      = groupLimit // Limit scaling if group Members would exceed partitions: "group" -> topic with max partitions, "topic" -> topic causing scaling up, "none"
 	defaultMinPartitionsWithLag              = 2          // Do not scale unless the lag is on at least that many parition.
 	defaultIgnoreTopicsMatching              = "-KSTREAM" // Coma separated list of strings, topics names containing this substring will not be used for scaling.
+	defaultResetOnHostCount                  = false      // with a short polling interval, we want to leave time for host count to stabilize, detrimental with long
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
+
 )
 
 type kafkaStreamsMetadata struct {
@@ -158,7 +160,7 @@ type kafkaStreamsMetadata struct {
 	BootstrapServers []string
 	Group            string
 	// Optional Metadata with no default values
-	Topic []string
+	Topics []string
 	// Optional Metadata with default values
 	LagRatio                          float64
 	CommitInterval                    int64
@@ -174,6 +176,7 @@ type kafkaStreamsMetadata struct {
 	LimitScaleUp                      LimitScaleUp
 	MinPartitionsWithLag              int64
 	IgnoreTopicsMatching              []string
+	ResetOnHostCount                  bool
 
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
@@ -219,9 +222,9 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 
 	// Optional parameters with no default values
 	// Topic is generally not necessary
-	if val, ok := config.TriggerMetadata["topic"]; ok {
+	if val, ok := config.TriggerMetadata["topics"]; ok {
 		names := strings.Split(val, ",")
-		meta.Topic = append(meta.Topic, names...)
+		meta.Topics = append(meta.Topics, names...)
 	}
 
 	// Optional parameters with a default value
@@ -353,6 +356,16 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		meta.IgnoreTopicsMatching = append(meta.IgnoreTopicsMatching, names...)
 	} else {
 		meta.IgnoreTopicsMatching = append(meta.IgnoreTopicsMatching, defaultIgnoreTopicsMatching)
+	}
+
+	if val, ok := config.TriggerMetadata["resetOnHostCount"]; ok {
+		reset, err := strconv.ParseBool(val)
+		if err != nil {
+			return nil, fmt.Errorf("resetOnHostCount must be \"true\" or \"false\"")
+		}
+		meta.ResetOnHostCount = reset
+	} else {
+		meta.ResetOnHostCount = defaultResetOnHostCount
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
@@ -635,7 +648,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 	// No scaling action if the number of hosts in the consumer group changes
 	lastHostCount := s.previousGroupMembersCount
 	s.previousGroupMembersCount = s.groupMembersCount
-	if s.groupMembersCount != lastHostCount {
+	if s.metadata.ResetOnHostCount && s.groupMembersCount != lastHostCount {
 		s.resetScalingMeasurementsCount()
 		return scaleFactor, scaleUpTargetMet, fmt.Errorf("reset measurements counts for group: %s hosts count changed from %d to %d", s.metadata.Group, lastHostCount, s.groupMembersCount)
 	}
@@ -894,15 +907,24 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 		hostsInGroup[member.ClientHost] = struct{}{}
 		for _, topic := range member.MemberMetadata.Topics {
 			if _, ok := topicsInGroup[topic]; !ok {
-				match := false
-				for _, substr := range s.metadata.IgnoreTopicsMatching {
-					if strings.Contains(topic, substr) {
-						match = true
-						break
+				if len(s.metadata.Topics) > 0 {
+					// Only topics specified in the config will be used
+					for _, config_topic := range s.metadata.Topics {
+						if topic == config_topic {
+							topicsInGroup[topic] = struct{}{}
+						}
 					}
-				}
-				if !match {
-					topicsInGroup[topic] = struct{}{}
+				} else {
+					match := false
+					for _, substr := range s.metadata.IgnoreTopicsMatching {
+						if strings.Contains(topic, substr) {
+							match = true
+							break
+						}
+					}
+					if !match {
+						topicsInGroup[topic] = struct{}{}
+					}
 				}
 			}
 		}
@@ -932,7 +954,7 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 	result := make(map[string][]int)
 	for _, topic := range clusterMeta.Topics {
 		// If the scaler specifies some topic(s) in the consumer groups, consider only those.
-		if len(s.metadata.Topic) > 0 && !kedautil.Contains(s.metadata.Topic, topic.Name) {
+		if len(s.metadata.Topics) > 0 && !kedautil.Contains(s.metadata.Topics, topic.Name) {
 			continue
 		}
 		partitions := make([]int, 0)
