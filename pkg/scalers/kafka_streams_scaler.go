@@ -63,7 +63,6 @@ type kafkaPartitionMetrics struct {
 	writeRate, readRate float64 // Rates in msg/millisecond
 	lag                 int64   // standard Kafka lag, in number of messages
 	residualLag         int64   // measure of avegrage expected lag in a consumer group that consumes messages close to 'as they are produced', in number of messages
-	lagRatio            float64 // no unit, lag/residualLag
 }
 
 // Kafka metrics evaluated for each topic in the consumer group
@@ -249,8 +248,8 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	}
 	if val, ok := config.TriggerMetadata["minPartitionWriteThrouput"]; ok {
 		minThroughput, err := strconv.ParseFloat(val, 64)
-		if err != nil || minThroughput <= 0.0 {
-			return nil, fmt.Errorf("minPartitionWriteThrouput must be a float in bytes/second greater than 0")
+		if err != nil || minThroughput < 0.0 {
+			return nil, fmt.Errorf("minPartitionWriteThrouput must be a float in bytes/second greater or equal than 0")
 		}
 		meta.MinPartitionWriteThrouput = minThroughput
 	} else {
@@ -474,17 +473,24 @@ func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger
 
 // Scaler Interface -- GetMetricsAndActivity()
 func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	s.logger.V(0).Info("GetMetricsAndActivity")
+	s.logger.V(1).Info("GetMetricsAndActivity")
+	var metricErr error = nil
 	metricVal, err := s.getMetricForHPA(ctx)
-
 	if err != nil {
 		// log the reason of the failed metric calculation, do not return the error to Keda.
+
 		s.logger.V(0).Info(fmt.Sprintf("HPA final, Metric = TARGET, no mesurement due to %s", err))
+		re, ok := err.(*consumerGroupError)
+		if ok {
+			if re.PermanentError() {
+				metricErr = err
+			}
+		}
 	}
 
 	// on errors, getMetricForHPA returns metric = TARGET
 	metric := GenerateMetricInMili(metricName, metricVal)
-	return []external_metrics.ExternalMetricValue{metric}, true, nil
+	return []external_metrics.ExternalMetricValue{metric}, true, metricErr
 }
 
 // Scaler Interface -- GetMetricSpecForScaling()
@@ -723,7 +729,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 
 		if tmetrics.readRate > (tmetrics.writeRate * float64(100-s.metadata.WritesToReadTolerance) / 100) {
 			// Reads are close to writes or greater
-			if tmetrics.readRate > tmetrics.writeRate {
+			if tmetrics.readRate > tmetrics.writeRate && tmetrics.lag > tmetrics.residualLag {
 				// check if we should just wait or scale up a notch to catch up faster when reads are higher than writes.
 				realLag := tmetrics.lag - tmetrics.residualLag
 				lagTimeToNomimal := float64(realLag) / ((tmetrics.readRate * 1000) - (tmetrics.writeRate * 1000))
@@ -837,22 +843,21 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 			tmetrics.writeRate += pmetrics.writeRate
 			tmetrics.readRate += pmetrics.readRate
 			tmetrics.partitionsTotal++
-			// lagRatio sum is meaningless, divided by number of paritions below
-			if pmetrics.lagRatio > 0 {
-				tmetrics.lagRatio += pmetrics.lagRatio
+			if pmetrics.lag > 0 {
 				tmetrics.partitionsWithLag++
 			}
 		}
-
-		if tmetrics.partitionsWithLag > 0 {
-			// Not clear if it ever make sense to set LimitToPartitionsWithLag to false, default is true
+		if tmetrics.residualLag > 0 {
+			// Topics Very small throughput can produce large LagRatio, ignore them  XXX configurable
 			if s.metadata.LimitToPartitionsWithLag {
-				tmetrics.lagRatio /= float64(tmetrics.partitionsWithLag)
+				if tmetrics.writeRate*1000/float64(tmetrics.partitionsWithLag) > s.metadata.MinPartitionWriteThrouput {
+					tmetrics.lagRatio = float64(tmetrics.lag) / float64(tmetrics.residualLag)
+				}
 			} else {
-				tmetrics.lagRatio /= float64(tmetrics.partitionsTotal)
+				if tmetrics.writeRate*1000/float64(tmetrics.partitionsTotal) > s.metadata.MinPartitionWriteThrouput {
+					tmetrics.lagRatio = float64(tmetrics.lag) / float64(tmetrics.residualLag)
+				}
 			}
-		} else {
-			tmetrics.lagRatio = 0.0
 		}
 		tmetrics.period = now - s.lastOffetsTime
 		s.topicMetrics[topic] = tmetrics
@@ -867,9 +872,37 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 
 	// log the metrics aggregated for all the topics in the Consumer Group
 	for name, topicMetrics := range s.topicMetrics {
-		s.logger.V(0).Info(fmt.Sprintf("LagRatio: %.3f, lag: %d, partitions/with lag: %d/%d, Write/s %.3f, Read/s %.3f, Group: %s, topic %s, interval(ms): %d", topicMetrics.lagRatio, topicMetrics.lag, topicMetrics.partitionsTotal, topicMetrics.partitionsWithLag, topicMetrics.writeRate*1000, topicMetrics.readRate*1000, s.metadata.Group, name, topicMetrics.period))
+		s.logger.V(0).Info(fmt.Sprintf("LagRatio: %.3f, lag: %d, residualLag: %d, partitions total/with lag: %d/%d, Write/s %.3f, Read/s %.3f, Group: %s, topic %s, interval(ms): %d", topicMetrics.lagRatio, topicMetrics.lag, topicMetrics.residualLag, topicMetrics.partitionsTotal, topicMetrics.partitionsWithLag, topicMetrics.writeRate*1000, topicMetrics.readRate*1000, s.metadata.Group, name, topicMetrics.period))
 	}
 	return nil
+}
+
+type ConsumerGroupState int
+
+const (
+	DescribeFailed = iota
+	NoMembers
+	//
+	Stable
+	Empty
+	PreparingRebalance
+	CompletingRebalance
+	Dead
+)
+
+type consumerGroupError struct {
+	msg        string // description of error
+	groupState ConsumerGroupState
+}
+
+func (e *consumerGroupError) Error() string { return e.msg }
+func (e *consumerGroupError) PermanentError() bool {
+	switch e.groupState {
+	case DescribeFailed, NoMembers, Empty, Dead:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string][]int, string, int64, int64, error) {
@@ -879,26 +912,34 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 		GroupIDs: []string{
 			s.metadata.Group,
 		},
-		// TODO: added to make v3 response compabible but does not seem to be helping.
-		IncludeAuthorizedOperations: 0,
 	}
 	// call to the broker
 	describeGrp, err := s.client.DescribeGroups(ctx, describeGrpReq)
 	if err != nil {
-		return nil, "", 0, 0, fmt.Errorf("error describing group: %w", err)
+		e := consumerGroupError{fmt.Sprintf("error describing group: %s: %s", s.metadata.Group, err), DescribeFailed}
+		return nil, "", 0, 0, &e
 	}
 	if len(describeGrp.Groups[0].Members) == 0 {
-		return nil, "", 0, 0, fmt.Errorf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState)
+		e := consumerGroupError{fmt.Sprintf("no active members in group %s, group-state is %s", s.metadata.Group, describeGrp.Groups[0].GroupState), NoMembers}
+		return nil, "", 0, 0, &e
 	}
 	// Requesting a single group, expecting a single response
 	groupState := describeGrp.Groups[0].GroupState
 	s.logger.V(2).Info(fmt.Sprintf("Consumer Group %s is in state %s", s.metadata.Group, groupState))
 	groupMembersCnt := int64(len(describeGrp.Groups[0].Members))
 	s.logger.V(2).Info(fmt.Sprintf("Consumer Group %s has %d members", s.metadata.Group, groupMembersCnt))
+	if groupState == "Dead" {
+		e := consumerGroupError{fmt.Sprintf("Consumer group %s state is %s", s.metadata.Group, groupState), Dead}
+		return nil, "", 0, 0, &e
+	}
+	if groupState == "Empty" {
+		e := consumerGroupError{fmt.Sprintf("Consumer group %s state is %s", s.metadata.Group, groupState), Empty}
+		return nil, "", 0, 0, &e
+	}
 
 	// This is sufficient in normal conditions:
 	//      describeGrp.Groups[0].Members[0].MemberMetadata.Topics
-	// during rebalancing, Members[0] can have no topic.  It may be missing a topic.
+	// but during rebalancing, Members[0] can have no topic.  It may be missing a topic.
 	// map for speed to get all the topics from all the members, and make it into an array for kafka-go API
 	// also records the number of hosts in the consumer group
 	topicsInGroup := make(map[string]struct{})
@@ -1037,14 +1078,9 @@ func (s *kafkaStreamsScaler) getPartitionMetric(topic string, partitionID int, c
 	partitionMetrics.readRate = float64(readMsg) / float64(period)
 	// Rates are stored in msg/ms, reported in logs in msg/s, period in ms
 	s.logger.V(1).Info(fmt.Sprintf("%.3f writes/s, %.3f reads/s for last %.3f seconds for topic partion %s:%d", partitionMetrics.writeRate*1000, partitionMetrics.readRate*1000, float64(period)/1000, topic, partitionID))
-
 	partitionMetrics.lag = producerOffset - consumerOffset
-	// very low write throughput, under 1 msg/s ballpark, can produce high lag ratio, not coutntion those
-	if partitionMetrics.writeRate*1000 > s.metadata.MinPartitionWriteThrouput {
-		partitionMetrics.residualLag = int64(partitionMetrics.writeRate * float64(s.metadata.CommitInterval) / 2.0)
-		partitionMetrics.lagRatio = float64(partitionMetrics.lag) / float64(partitionMetrics.residualLag)
-	}
-	s.logger.V(1).Info(fmt.Sprintf("lagRatio %.6f based on residualLag %d for topic partion %s:%d", partitionMetrics.lagRatio, partitionMetrics.residualLag, topic, partitionID))
+	partitionMetrics.residualLag = int64(partitionMetrics.writeRate * float64(s.metadata.CommitInterval) / 2.0)
+	s.logger.V(1).Info(fmt.Sprintf("ResidualLag %d for topic partion %s:%d", partitionMetrics.residualLag, topic, partitionID))
 	return partitionMetrics, nil
 }
 
