@@ -478,7 +478,6 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 	metricVal, err := s.getMetricForHPA(ctx)
 	if err != nil {
 		// log the reason of the failed metric calculation, do not return the error to Keda.
-
 		s.logger.V(0).Info(fmt.Sprintf("HPA final, Metric = TARGET, no mesurement due to %s", err))
 		re, ok := err.(*consumerGroupError)
 		if ok {
@@ -721,7 +720,6 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 		}
 
 		if s.groupMembersCount >= partitions {
-			// s.logger.V(0).Info(fmt.Sprintf("HPA Metric: not scaling up, group already has one member for each patition (%d)", s.groupMembersCount))
 			scaleFactor = 1.0
 			s.resetScalingMeasurementsCount()
 			return scaleFactor, scaleUpTargetMet, fmt.Errorf("HPA Metric: not scaling up, group already has one member for each patition (%d)", s.groupMembersCount)
@@ -787,18 +785,18 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 		// reads and writes are close, go ahead with scale down
 		case withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)):
 			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%, scaleDownFactor: %d%%",
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
 				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
 		default:
 			// TODDO: needs more battle testing.
 			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%, scaleDownFactor: %d%",
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
 				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
 		}
 	} else {
 		s.underThreasholdCount = 0
-		s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d on topic %s, scaleDownFatcor: %d%",
-			tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName))
+		s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%% on topic %s, scaleDownFatcor: %f",
+			tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName, s.metadata.ScaleDownFactor))
 	}
 
 	if s.underThreasholdCount >= s.metadata.MeasurementsForScale {
