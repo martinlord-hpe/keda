@@ -743,7 +743,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 			} else {
 				// write/s are highve than read/s but just but just within writesToReadTolerance)
 				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: read/s < write/s but within ritesToReadTolerance %d%%,  minimum scale up for topic %s", s.metadata.WritesToReadTolerance, topicName))
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: read/s < write/s but within writesToReadTolerance %d%%,  minimum scale up for topic %s", s.metadata.WritesToReadTolerance, topicName))
 			}
 		} else {
 			// writes can be much higher than reads in situations like initial kafka throughput load is applied suddently
@@ -787,17 +787,17 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 		// reads and writes are close, go ahead with scale down
 		case withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)):
 			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
-				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance))
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%, scaleDownFactor: %d%%",
+				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
 		default:
 			// TODDO: needs more battle testing.
 			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d",
-				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance))
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%, scaleDownFactor: %d%",
+				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
 		}
 	} else {
 		s.underThreasholdCount = 0
-		s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, tolerance: %d on topic %s",
+		s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d on topic %s, scaleDownFatcor: %d%",
 			tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName))
 	}
 
