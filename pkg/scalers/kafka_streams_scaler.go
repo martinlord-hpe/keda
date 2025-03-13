@@ -19,11 +19,13 @@ package scalers
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -42,13 +44,13 @@ import (
 
 /*
 
- To emit the single metric in getMetricsAndActiviy(), this scaler upses multiple kafka metrics and data points
- from the brokers.  All those internal metrics rely on a time interval, for this reason and due to the 'liverly'
+ To emit the single metric in getMetricsAndActiviy(), this scaler upses kafka metrics from the brokers.
+ All those internal metrics rely on a time interval, for this reason and due to the 'lively'
  nature of kakfka consumer offsets metrics, thought the scaler will adapt to SO cofiguration, it will produce best results
  with a polling interval of a minute or more with HPA defaul config of --horizontal-pod-autoscaler-sync-period 15 seconds.
 
  Scaler logic assumes metricType: Value and useCachedMetrics as below, it makes scaling decisions at the consumer group
- level, metricType: Average does not apply.
+ level, metricType: Average does not apply to this scaler
 
 spec:
   pollingInterval: 60
@@ -67,14 +69,17 @@ type kafkaPartitionMetrics struct {
 
 // Kafka metrics evaluated for each topic in the consumer group
 type kafkaTopicMetrics struct {
-	writeRate, readRate float64 // Rates in msg/millisecond
-	lag, residualLag    int64   // in number of messages
-	lagRatio            float64 // no unit, lag/residualLag
-	period              int64   // number of milliseconds over which above rates are calculated,  with useCachedMetrics: true, it should be close to pollingInterval
-	partitionsWithLag   int64   // # topic partitions with a measurable lag
-	partitionsTotal     int64   // # total partitions in the topic
+	WriteRate         float64 // Rates in msg/millisecond
+	ReadRate          float64
+	Lag               int64 // in number of messages
+	ResidualLag       int64
+	LagRatio          float64 // no unit, lag/residualLag
+	Period            int64   // number of milliseconds over which above rates are calculated,  with useCachedMetrics: true, it should be close to pollingInterval
+	PartitionsWithLag int64   // # topic partitions with a measurable lag
+	PartitionsTotal   int64   // # total partitions in the topic
 }
 
+// and metrics State for EACH Scale Object
 type kafkaStreamsScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *kafkaStreamsMetadata // scaler config from coarse validation of user input + default values
@@ -103,7 +108,7 @@ type kafkaStreamsScaler struct {
  It would be nice to use HPA policies, but 'periodSeconds' and 'stabilizationWindowSeconds' semantic is different, rolling
  maximum is a different behavior thatn emitting a single metric that will cause scale up/down'.  Better decision can
  be made in the scaler rater than emitting a metric at ever polloing interval and counting on policies and rolling max for final decisions.
- This scaler will produce best results with disablinng cooldown and set periodsSeconds under pollingInterval like this:
+ This scaler will produce best results with settiongs like this:
  spec:
   pollingInterval: 60
   initialCooldownPeriod: 60
@@ -120,9 +125,21 @@ type kafkaStreamsScaler struct {
             - type: Pods
               value: 1
               periodSeconds: 60
+	    scaleDown:
+          stabilizationWindowSeconds: 0
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+            - type: Percent
+              value: 20
+              periodSeconds: 60
+
 
 */
 
+// see defaultLimitScaleUp
 type LimitScaleUp int
 
 const (
@@ -149,9 +166,9 @@ const (
 	defaultMinPartitionsWithLag              = 2          // Do not scale unless the lag is on at least that many parition.
 	defaultIgnoreTopicsMatching              = "-KSTREAM" // Coma separated list of strings, topics names containing this substring will not be used for scaling.
 	defaultResetOnHostCount                  = false      // with a short polling interval, we want to leave time for host count to stabilize, detrimental with long
+	defaultMinMembersScaleDownFloor          = 2          // Scale down will stop once the consumer group members is down to this value
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
-
 )
 
 type kafkaStreamsMetadata struct {
@@ -176,7 +193,7 @@ type kafkaStreamsMetadata struct {
 	MinPartitionsWithLag              int64
 	IgnoreTopicsMatching              []string
 	ResetOnHostCount                  bool
-
+	minMembersScaleDownFloor          int64
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
 	// SASL
@@ -196,6 +213,34 @@ type kafkaStreamsMetadata struct {
 
 	triggerIndex int
 }
+
+// Metrics are updated on a scale up event and form a base like for write/s rate.
+// Scaler uses a compacted topic for persistent storage of learned topic rates for downscaling
+// Metrics are read at start up to initialize the scaler
+
+const kedaKafaStreamsTopic = "keda-kafka-streams-rates"
+
+// There is a single producer instance shared with all the SOs
+type kedaKafkaProducer struct {
+	mu       sync.Mutex
+	producer *kafka.Writer
+}
+
+var kedaProducer kedaKafkaProducer
+
+// Only the first SO to start will read the compacted topic once and all SO will
+// initialize their state from global kafkaStreamsSavedMetrics
+type persistentTopicMetric struct {
+	TopicName   string
+	TopicMetric kafkaTopicMetrics
+}
+type kafkaStreamsPersistentMetrics struct {
+	mu           sync.Mutex
+	initialized  bool
+	savedMetrics map[string]persistentTopicMetric // key is Group name
+}
+
+var kafkaStreamsSavedMetrics kafkaStreamsPersistentMetrics
 
 func (a *kafkaStreamsMetadata) enableTLS() bool {
 	// TODO: Not implemented!  No authentication
@@ -225,8 +270,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		names := strings.Split(val, ",")
 		meta.Topics = append(meta.Topics, names...)
 	}
-
-	// Optional parameters with a default value
 	if val, ok := config.TriggerMetadata["lagRatio"]; ok {
 		lagRatio, err := strconv.ParseFloat(val, 64)
 		if err != nil || lagRatio <= 1.0 {
@@ -236,7 +279,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.LagRatio = defaultLagRatio
 	}
-
 	if val, ok := config.TriggerMetadata["commitInterval"]; ok {
 		commitInterval, err := strconv.ParseInt(val, 10, 64)
 		if err != nil || commitInterval <= 0 {
@@ -356,7 +398,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.IgnoreTopicsMatching = append(meta.IgnoreTopicsMatching, defaultIgnoreTopicsMatching)
 	}
-
 	if val, ok := config.TriggerMetadata["resetOnHostCount"]; ok {
 		reset, err := strconv.ParseBool(val)
 		if err != nil {
@@ -365,6 +406,15 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		meta.ResetOnHostCount = reset
 	} else {
 		meta.ResetOnHostCount = defaultResetOnHostCount
+	}
+	if val, ok := config.TriggerMetadata["minMembersScaleDownFloor"]; ok {
+		min, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || min < 1 {
+			return nil, fmt.Errorf("minMembersScaleDownFloor must be a inteter greater or equal than 1")
+		}
+		meta.minMembersScaleDownFloor = min
+	} else {
+		meta.minMembersScaleDownFloor = defaultMinMembersScaleDownFloor
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
@@ -385,9 +435,33 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		return nil, err
 	}
 	logger := InitializeLogger(config, "kafka_streams_scaler")
+
+	// kafka-go, each scaler has it's own client, producer is shared with all scalers.
 	client, err := getKafkaGoClient(ctx, *meta, logger)
 	if err != nil {
 		return nil, err
+	}
+	// Created the compacted topic if it does not exist yet
+	err = createProducerTopic(client)
+	if err != nil {
+		return nil, err
+	}
+	kedaProducer.createProducer(meta.BootstrapServers)
+
+	// Metrics loaded from compacted topic only once for all SO by the first SO being created.
+	kafkaStreamsSavedMetrics.ReadCompactedTopic(meta.BootstrapServers, logger)
+	m, ok := kafkaStreamsSavedMetrics.savedMetrics[meta.Group]
+	lst := "Not Set"
+	var lsm *kafkaTopicMetrics
+	if ok {
+		logger.V(1).Info(fmt.Sprintf("Compacted Topic - Read Group:%s, topic: %s, write/ms: %f",
+			meta.Group, m.TopicName, m.TopicMetric.WriteRate))
+		lst = m.TopicName
+		lsm = &m.TopicMetric
+	} else {
+		// Any SO/consumer group that never scaled up will not have a saved metric.
+		// This should be the case for consumer groups suck at "minMembersScaleDownFloor", default 2
+		logger.V(1).Info(fmt.Sprintf("Compacted Topic - Group %s not found", meta.Group))
 	}
 
 	previousConsumerOffsets := make(map[string]map[int]int64)
@@ -406,69 +480,9 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		topicMetrics:            topicMetrics,
 		writesRollingAvg:        writesRollingAvg,
 		aboveThresholdCount:     aboveThresholdCount,
-		lastScaleUpTopicName:    "Not Set",
-		lastScaleUpMetrics:      nil,
+		lastScaleUpTopicName:    lst,
+		lastScaleUpMetrics:      lsm,
 	}, nil
-}
-
-// initializes Kafka go client
-func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger logr.Logger) (*kafka.Client, error) {
-	var saslMechanism sasl.Mechanism
-	var tlsConfig *tls.Config
-	var err error
-
-	logger.V(4).Info(fmt.Sprintf("Kafka SASL type %s", metadata.SASLType))
-	if metadata.enableTLS() {
-		tlsConfig, err = kedautil.NewTLSConfigWithPassword(metadata.Cert, metadata.Key, metadata.KeyPassword, metadata.CA, false)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	switch metadata.SASLType {
-	case KafkaSASLTypeNone:
-		saslMechanism = nil
-	case KafkaSASLTypePlaintext:
-		saslMechanism = plain.Mechanism{
-			Username: metadata.Username,
-			Password: metadata.Password,
-		}
-	case KafkaSASLTypeSCRAMSHA256:
-		saslMechanism, err = scram.Mechanism(scram.SHA256, metadata.Username, metadata.Password)
-		if err != nil {
-			return nil, err
-		}
-	case KafkaSASLTypeSCRAMSHA512:
-		saslMechanism, err = scram.Mechanism(scram.SHA512, metadata.Username, metadata.Password)
-		if err != nil {
-			return nil, err
-		}
-	case KafkaSASLTypeOAuthbearer:
-		return nil, errors.New("SASL/OAUTHBEARER is not implemented yet")
-	case KafkaSASLTypeMskIam:
-		cfg, err := awsutils.GetAwsConfig(ctx, metadata.AWSRegion, metadata.AWSAuthorization)
-		if err != nil {
-			return nil, err
-		}
-
-		saslMechanism = aws_msk_iam_v2.NewMechanism(*cfg)
-	default:
-		return nil, fmt.Errorf("err sasl type %q given", metadata.SASLType)
-	}
-
-	transport := &kafka.Transport{
-		TLS:  tlsConfig,
-		SASL: saslMechanism,
-	}
-	client := kafka.Client{
-		Addr:      kafka.TCP(metadata.BootstrapServers...),
-		Transport: transport,
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error creating kafka client: %w", err)
-	}
-
-	return &client, nil
 }
 
 // Scaler Interface -- GetMetricsAndActivity()
@@ -493,10 +507,9 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 }
 
 // Scaler Interface -- GetMetricSpecForScaling()
-// TODO consider using a better TARGET ?  TARGET is set at lagRatio threshold, however although LagRatio is a key element for scaling up,
+// TODO.  Cosmetic issue.  Consider using a different TARGET ?  TARGET is set at lagRatio threshold, however although LagRatio is a key element for scaling up,
 // the final metric returned to HPA is NOT just measured LagRatio, it takes into account other internal metrics to emit a number that will
 // have 'desired' effect on replicas count based on over streaming consumer group state
-
 func (s *kafkaStreamsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	metricName := fmt.Sprintf("kafka-streams-%s-topics", s.metadata.Group)
 	metricTarget := s.metadata.LagRatio
@@ -511,7 +524,7 @@ func (s *kafkaStreamsScaler) GetMetricSpecForScaling(context.Context) []v2.Metri
 	return []v2.MetricSpec{metricSpec}
 }
 
-// Scaler Interface: Clos()
+// Scaler Interface: Close()
 func (s *kafkaStreamsScaler) Close(context.Context) error {
 	if s.client == nil {
 		return nil
@@ -524,15 +537,24 @@ func (s *kafkaStreamsScaler) Close(context.Context) error {
 	return nil
 }
 
-// Update all consumer group, topic, partitions metrics, make scaling decsion, calculate the SO metric for HPA
+// Update consumer group topic & partitions metrics, make scaling decsion, calculate the SO metric for HPA
 func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, error) {
-	s.pollingCount++ // internal stat
-	hpaMetric := s.metadata.LagRatio
+	s.pollingCount++ // internal stat, not used for scaling.
+
+	hpaMetric := s.metadata.LagRatio // initialized to TARGET
 	err := s.getAllConsumerGroupMetrics(ctx)
 	if err != nil {
 		s.resetScalingMeasurementsCount()
 		return hpaMetric, err
 	}
+
+	err = s.isConsumerGroupStatble()
+	if err != nil {
+		// consumer group is not stable, restart threshold counts.
+		s.resetScalingMeasurementsCount()
+		return hpaMetric, err
+	}
+
 	factor, scaleUpTargetMet, err := s.getScaleUpDecisionAndFactor()
 	if err != nil {
 		s.resetScalingMeasurementsCount()
@@ -551,13 +573,14 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	}
 
 	// Pick most relevant topic for logging/debugging only.
+	// TODO: keep this?   lotss of code for creating one log entry...
 	topicInfoForLog := ""
 	switch {
 	case scaleUpTargetMet:
 		a := int64(0)
 		ratio := 0.0
 		for name, cnt := range s.aboveThresholdCount {
-			r := s.topicMetrics[name].lagRatio
+			r := s.topicMetrics[name].LagRatio
 			switch {
 			case cnt > a:
 				a = cnt
@@ -576,8 +599,8 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	default:
 		ratio := 0.0
 		for name, topicMetrics := range s.topicMetrics {
-			if topicMetrics.lagRatio > ratio {
-				ratio = topicMetrics.lagRatio
+			if topicMetrics.LagRatio > ratio {
+				ratio = topicMetrics.LagRatio
 				topicInfoForLog = name
 			}
 		}
@@ -592,10 +615,11 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 		action = "Scaling: down: "
 	}
 	s.logger.V(0).Info(fmt.Sprintf("%s, Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, group: %s on topic: %s",
-		action, hpaMetric*factor, s.groupState, met.lagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.lag, met.residualLag, met.writeRate*1000, met.readRate*1000, s.writesRollingAvg[topicInfoForLog]*1000, s.metadata.Group, topicInfoForLog))
+		action, hpaMetric*factor, s.groupState, met.LagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.Lag, met.ResidualLag, met.WriteRate*1000, met.ReadRate*1000, s.writesRollingAvg[topicInfoForLog]*1000, s.metadata.Group, topicInfoForLog))
 	if s.lastScaleUpMetrics != nil {
-		s.logger.V(0).Info(fmt.Sprintf("Final Metric: last scale up topic: %s, write/s: %f", s.lastScaleUpTopicName, s.lastScaleUpMetrics.writeRate*1000))
+		s.logger.V(1).Info(fmt.Sprintf("Final Metric: last scale up topic: %s, write/s: %f", s.lastScaleUpTopicName, s.lastScaleUpMetrics.WriteRate*1000))
 	}
+
 	return hpaMetric * factor, nil
 }
 
@@ -620,14 +644,30 @@ func (s *kafkaStreamsScaler) updateRollingAvg() {
 		s.pollingStableCount++
 		return
 	}
+	// TODO: number of periods for rolling average should have its own knob?
 	cnt := math.Min(float64(s.pollingStableCount), float64(s.metadata.MeasurementsForScale))
 	for name := range s.writesRollingAvg {
 		old_avg := s.writesRollingAvg[name]
 		// basic formula for calculating rolling average with just last avg and window size
-		s.writesRollingAvg[name] = (old_avg * (cnt - 1) / cnt) + (s.topicMetrics[name].writeRate / float64(cnt))
+		s.writesRollingAvg[name] = (old_avg * (cnt - 1) / cnt) + (s.topicMetrics[name].WriteRate / float64(cnt))
 	}
 	s.logger.V(2).Info(fmt.Sprintf("Rolling: %v pool:%d ", s.writesRollingAvg, s.pollingStableCount))
 	s.pollingStableCount++
+}
+
+// Check if consumer group is not stable or members number has changed since last poll
+func (s *kafkaStreamsScaler) isConsumerGroupStatble() (err error) {
+	// No scaling action unless the consumer group is 'Stable', reset all counts and re-start measuring when stable.
+	if s.groupState != "Stable" {
+		return fmt.Errorf("reset measurements counts for group: %s in state %s", s.metadata.Group, s.groupState)
+	}
+	// No scaling action if the number of hosts in the consumer group changed since last polling interval
+	lastHostCount := s.previousGroupMembersCount
+	s.previousGroupMembersCount = s.groupMembersCount
+	if s.metadata.ResetOnHostCount && s.groupMembersCount != lastHostCount {
+		return fmt.Errorf("reset measurements counts for group: %s hosts count changed from %d to %d", s.metadata.Group, lastHostCount, s.groupMembersCount)
+	}
+	return nil
 }
 
 /*
@@ -644,25 +684,14 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 	topicName := "" // name of the most relevant topic in the consumer group when reaching a scaling decision point
 	topicWrites := 0.0
 	scaleUpCount := int64(0)
+	var tmetrics kafkaTopicMetrics
 
-	// No scaling action unless the consumer group is 'Stable', reset all counts and re-start measuring when stable.
-	if s.groupState != "Stable" {
-		s.resetScalingMeasurementsCount()
-		return scaleFactor, scaleUpTargetMet, fmt.Errorf("reset measurements counts for group: %s in state %s", s.metadata.Group, s.groupState)
-	}
-	// No scaling action if the number of hosts in the consumer group changes
-	lastHostCount := s.previousGroupMembersCount
-	s.previousGroupMembersCount = s.groupMembersCount
-	if s.metadata.ResetOnHostCount && s.groupMembersCount != lastHostCount {
-		s.resetScalingMeasurementsCount()
-		return scaleFactor, scaleUpTargetMet, fmt.Errorf("reset measurements counts for group: %s hosts count changed from %d to %d", s.metadata.Group, lastHostCount, s.groupMembersCount)
-	}
 	s.updateRollingAvg()
 
 	// update lagRatio consecutive threshold counts for all topics
 	for name, topicMetrics := range s.topicMetrics {
-		if topicMetrics.lagRatio > s.metadata.LagRatio {
-			if s.topicMetrics[name].partitionsWithLag >= s.metadata.MinPartitionsWithLag {
+		if topicMetrics.LagRatio > s.metadata.LagRatio {
+			if s.topicMetrics[name].PartitionsWithLag >= s.metadata.MinPartitionsWithLag {
 				// Default config is 2, dont pointlessly scale if lag is on one partition.
 				s.aboveThresholdCount[name]++
 				scaleUpTargetMet = true // target is met, may or many not scale up
@@ -675,16 +704,16 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 		}
 	}
 
-	// check if we meet MesurementsForScale, and select the most relevant topic for later scale dowwn (largest throughput)
+	// check if we meet MesurementsForScale  consecutive thresholds, and select the most relevant topic for later scale dowwn (largest throughput)
 	for name, cnt := range s.aboveThresholdCount {
 		if scaleUpOnMultipleTopic {
 			// not implemented yet
 		} else {
 			if cnt >= scaleUpCount {
 				scaleUpCount = cnt
-				if s.topicMetrics[name].writeRate > topicWrites {
+				if s.topicMetrics[name].WriteRate > topicWrites {
 					topicName = name
-					topicWrites = s.topicMetrics[name].writeRate
+					topicWrites = s.topicMetrics[name].WriteRate
 				}
 			}
 		}
@@ -696,22 +725,23 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 			return scaleFactor, scaleUpTargetMet, fmt.Errorf("unexpected error in scale up decision, no topic name")
 		}
 
-		tmetrics := s.topicMetrics[topicName]
+		tmetrics = s.topicMetrics[topicName]
 		s.lastScaleUpTopicName = topicName
 		s.lastScaleUpMetrics = &tmetrics
+
 		// This part will skip scaling up if the number of members would become greater than the partition count (3 config options)
 		partitions := int64(0)
 		switch s.metadata.LimitScaleUp {
 		case groupLimit:
 			for _, tm := range s.topicMetrics {
-				if tm.partitionsTotal > partitions {
-					partitions = tm.partitionsTotal
+				if tm.PartitionsTotal > partitions {
+					partitions = tm.PartitionsTotal
 				}
 			}
 		case topicLimit:
-			if s.groupMembersCount >= tmetrics.partitionsTotal {
+			if s.groupMembersCount >= tmetrics.PartitionsTotal {
 				// topic that would cause scaling up already has as many members as paritions
-				partitions = tmetrics.partitionsTotal
+				partitions = tmetrics.PartitionsTotal
 			}
 		case noLimit:
 			partitions = math.MaxInt64
@@ -725,12 +755,12 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 			return scaleFactor, scaleUpTargetMet, fmt.Errorf("HPA Metric: not scaling up, group already has one member for each patition (%d)", s.groupMembersCount)
 		}
 
-		if tmetrics.readRate > (tmetrics.writeRate * float64(100-s.metadata.WritesToReadTolerance) / 100) {
+		if tmetrics.ReadRate > (tmetrics.WriteRate * float64(100-s.metadata.WritesToReadTolerance) / 100) {
 			// Reads are close to writes or greater
-			if tmetrics.readRate > tmetrics.writeRate && tmetrics.lag > tmetrics.residualLag {
+			if tmetrics.ReadRate > tmetrics.WriteRate && tmetrics.Lag > tmetrics.ResidualLag {
 				// check if we should just wait or scale up a notch to catch up faster when reads are higher than writes.
-				realLag := tmetrics.lag - tmetrics.residualLag
-				lagTimeToNomimal := float64(realLag) / ((tmetrics.readRate * 1000) - (tmetrics.writeRate * 1000))
+				realLag := tmetrics.Lag - tmetrics.ResidualLag
+				lagTimeToNomimal := float64(realLag) / ((tmetrics.ReadRate * 1000) - (tmetrics.WriteRate * 1000))
 				if int64(lagTimeToNomimal) > s.metadata.AllowedTimeLagCatchUp {
 					scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
 					s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %ds greater than %ds, minimum scale up for topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
@@ -739,7 +769,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 					s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Lag catch up time %d lower than %ds, not scaling up topic %s", int64(lagTimeToNomimal), s.metadata.AllowedTimeLagCatchUp, topicName))
 				}
 			} else {
-				// write/s are highve than read/s but just but just within writesToReadTolerance)
+				// write/s are higher than read/s but just but just within writesToReadTolerance)
 				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: read/s < write/s but within writesToReadTolerance %d%%,  minimum scale up for topic %s", s.metadata.WritesToReadTolerance, topicName))
 			}
@@ -750,57 +780,68 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 
 			// internal rates in mgs/ms.   minReadRateToUseForReplicasCount is the minimum read rate
 			// necessary to use writes to read ratio.  Too low values can cause excessive scaling up
-			if tmetrics.readRate*1000 >= float64(s.metadata.MinReadRateToUseForReplicasCount) {
-				scaleFactor = math.Max(tmetrics.writeRate/tmetrics.readRate*s.metadata.WritesToReadRatioDampening, s.metadata.HPAMetricFactorMinimumScaleFactor)
+			if tmetrics.ReadRate*1000 >= float64(s.metadata.MinReadRateToUseForReplicasCount) {
+				scaleFactor = math.Max(tmetrics.WriteRate/tmetrics.ReadRate*s.metadata.WritesToReadRatioDampening, s.metadata.HPAMetricFactorMinimumScaleFactor)
 				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Using Write/s to Read/s scale factor %.3f for scale up for topic %s", scaleFactor, topicName))
 			} else {
 				scaleFactor = s.metadata.HPAMetricFactorMinimumScaleFactor
-				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s %.3f to low to estimate Write/s to Read/s for scale up for topic %s, minimum scaling", tmetrics.readRate*1000, topicName))
+				s.logger.V(0).Info(fmt.Sprintf("HPA Metric: Read/s %.3f to low to estimate Write/s to Read/s for scale up for topic %s, minimum scaling", tmetrics.ReadRate*1000, topicName))
 			}
 		}
 		s.resetScalingMeasurementsCount()
 	}
 
+	// save metrics on compacted topic when we are really scaling up.
+	if scaleFactor != 1.0 {
+		err := kedaProducer.publishConsumerGroupMetrics(s.metadata.Group, topicName, &tmetrics)
+		if err != nil {
+			s.logger.V(0).Info(fmt.Sprintf("Compact pub: %s", err.Error()))
+		}
+	}
 	return scaleFactor, scaleUpTargetMet, nil
 }
 
 func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float64, scaleDownTargetMet bool, err error) {
 	scaleFactor = 1.0
-
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
-		// no baseline
-		return scaleFactor, scaleDownTargetMet, nil
-	}
-	tmetrics, ok := s.topicMetrics[s.lastScaleUpTopicName]
-	if !ok {
-		// Somehow, we do not have recent metrics for the topic name that caused last scale up
-		s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has not metrics for topic that caused last scale up: %s", s.metadata.Group, s.lastScaleUpTopicName))
-		return scaleFactor, scaleDownTargetMet, nil
-	}
-
-	// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and
-	// and write throughput is down by configured factor.
-	if tmetrics.readRate > 0.0 && tmetrics.writeRate > 0.0 && tmetrics.writeRate < s.lastScaleUpMetrics.writeRate*s.metadata.ScaleDownFactor {
-		switch {
-		// reads and writes are close, go ahead with scale down
-		case withinPercentage(tmetrics.writeRate, tmetrics.readRate, float64(s.metadata.WritesToReadTolerance)):
+		// no baseline, let's scale down to unless we reached mimimum consumer group memebers
+		if s.groupMembersCount > s.metadata.minMembersScaleDownFloor {
+			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScale))
 			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
-				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
-		default:
-			// TODDO: needs more battle testing.
-			s.underThreasholdCount++
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
-				tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
+			scaleDownTargetMet = true
 		}
 	} else {
-		s.underThreasholdCount = 0
-		s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%% on topic %s, scaleDownFatcor: %f",
-			tmetrics.writeRate*1000, tmetrics.readRate*1000, s.lastScaleUpMetrics.writeRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName, s.metadata.ScaleDownFactor))
+		tmetrics, ok := s.topicMetrics[s.lastScaleUpTopicName]
+		if !ok {
+			// Somehow, we do not have recent metrics for the topic name we saved that caused last scale up
+			// ot supposed to happen, right behaviour?
+			return scaleFactor, false, fmt.Errorf("unexpected scaler state, topic missing metrics: %s", s.lastScaleUpTopicName)
+		}
+		// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and
+		// and write throughput is down by configured factor.
+		if tmetrics.ReadRate > 0.0 && tmetrics.WriteRate > 0.0 && tmetrics.WriteRate < s.lastScaleUpMetrics.WriteRate*s.metadata.ScaleDownFactor {
+			switch {
+			// reads and writes are close, go ahead with scale down
+			case withinPercentage(tmetrics.WriteRate, tmetrics.ReadRate, float64(s.metadata.WritesToReadTolerance)):
+				s.underThreasholdCount++
+				scaleDownTargetMet = true
+				s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
+					tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
+			default:
+				s.underThreasholdCount++
+				scaleDownTargetMet = true
+				s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
+					tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
+			}
+		} else {
+			s.underThreasholdCount = 0
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%% on topic %s, scaleDownFatcor: %f",
+				tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName, s.metadata.ScaleDownFactor))
+		}
 	}
 
 	if s.underThreasholdCount >= s.metadata.MeasurementsForScale {
-		scaleDownTargetMet = true
+		s.resetScalingMeasurementsCount()
 		// HPA metric: desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
 		// with the above algo in HPA, if we want to down scale from up to 3 to 2, the metricc must be that low.
 		// using HPA policies in the SOPto soften
@@ -836,28 +877,28 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 			if err != nil {
 				return err
 			}
-			tmetrics.lag += pmetrics.lag
-			tmetrics.residualLag += pmetrics.residualLag
-			tmetrics.writeRate += pmetrics.writeRate
-			tmetrics.readRate += pmetrics.readRate
-			tmetrics.partitionsTotal++
+			tmetrics.Lag += pmetrics.lag
+			tmetrics.ResidualLag += pmetrics.residualLag
+			tmetrics.WriteRate += pmetrics.writeRate
+			tmetrics.ReadRate += pmetrics.readRate
+			tmetrics.PartitionsTotal++
 			if pmetrics.lag > 0 {
-				tmetrics.partitionsWithLag++
+				tmetrics.PartitionsWithLag++
 			}
 		}
-		if tmetrics.residualLag > 0 {
-			// Topics Very small throughput can produce large LagRatio, ignore them  XXX configurable
+		if tmetrics.ResidualLag > 0 {
+			// Topics Very small throughput can produce large LagRatio, ignore
 			if s.metadata.LimitToPartitionsWithLag {
-				if tmetrics.writeRate*1000/float64(tmetrics.partitionsWithLag) > s.metadata.MinPartitionWriteThrouput {
-					tmetrics.lagRatio = float64(tmetrics.lag) / float64(tmetrics.residualLag)
+				if tmetrics.WriteRate*1000/float64(tmetrics.PartitionsWithLag) > s.metadata.MinPartitionWriteThrouput {
+					tmetrics.LagRatio = float64(tmetrics.Lag) / float64(tmetrics.ResidualLag)
 				}
 			} else {
-				if tmetrics.writeRate*1000/float64(tmetrics.partitionsTotal) > s.metadata.MinPartitionWriteThrouput {
-					tmetrics.lagRatio = float64(tmetrics.lag) / float64(tmetrics.residualLag)
+				if tmetrics.WriteRate*1000/float64(tmetrics.PartitionsTotal) > s.metadata.MinPartitionWriteThrouput {
+					tmetrics.LagRatio = float64(tmetrics.Lag) / float64(tmetrics.ResidualLag)
 				}
 			}
 		}
-		tmetrics.period = now - s.lastOffetsTime
+		tmetrics.Period = now - s.lastOffetsTime
 		s.topicMetrics[topic] = tmetrics
 		// initialize the topic names for holding write/s rolling averages.
 		_, ok := s.writesRollingAvg[topic]
@@ -870,7 +911,7 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 
 	// log the metrics aggregated for all the topics in the Consumer Group
 	for name, topicMetrics := range s.topicMetrics {
-		s.logger.V(0).Info(fmt.Sprintf("LagRatio: %.3f, lag: %d, residualLag: %d, partitions total/with lag: %d/%d, Write/s %.3f, Read/s %.3f, Group: %s, topic %s, interval(ms): %d", topicMetrics.lagRatio, topicMetrics.lag, topicMetrics.residualLag, topicMetrics.partitionsTotal, topicMetrics.partitionsWithLag, topicMetrics.writeRate*1000, topicMetrics.readRate*1000, s.metadata.Group, name, topicMetrics.period))
+		s.logger.V(0).Info(fmt.Sprintf("LagRatio: %.3f, lag: %d, residualLag: %d, partitions total/with lag: %d/%d, Write/s %.3f, Read/s %.3f, Group: %s, topic %s, interval(ms): %d", topicMetrics.LagRatio, topicMetrics.Lag, topicMetrics.ResidualLag, topicMetrics.PartitionsTotal, topicMetrics.PartitionsWithLag, topicMetrics.WriteRate*1000, topicMetrics.ReadRate*1000, s.metadata.Group, name, topicMetrics.Period))
 	}
 	return nil
 }
@@ -1180,6 +1221,193 @@ func (s *kafkaStreamsScaler) getCurrentAndUpdatePreivouOffsets(topic string, par
 	s.logger.V(1).Info(fmt.Sprintf("Offsets for group %s topic partition %s:%d, , Last Offset %d, Previous Last Offset %d Committed Offset %d, Previous Committed Offset %d", s.metadata.Group, topic, partitionID, producerOffset, previousProducerOffset, consumerOffset, previousConsumerOffset))
 
 	return consumerOffset, previousConsumerOffset, producerOffset, previousProducerOffset
+}
+
+// initializes Kafka go client
+func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger logr.Logger) (*kafka.Client, error) {
+	var saslMechanism sasl.Mechanism
+	var tlsConfig *tls.Config
+	var err error
+
+	logger.V(4).Info(fmt.Sprintf("Kafka SASL type %s", metadata.SASLType))
+	if metadata.enableTLS() {
+		tlsConfig, err = kedautil.NewTLSConfigWithPassword(metadata.Cert, metadata.Key, metadata.KeyPassword, metadata.CA, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	switch metadata.SASLType {
+	case KafkaSASLTypeNone:
+		saslMechanism = nil
+	case KafkaSASLTypePlaintext:
+		saslMechanism = plain.Mechanism{
+			Username: metadata.Username,
+			Password: metadata.Password,
+		}
+	case KafkaSASLTypeSCRAMSHA256:
+		saslMechanism, err = scram.Mechanism(scram.SHA256, metadata.Username, metadata.Password)
+		if err != nil {
+			return nil, err
+		}
+	case KafkaSASLTypeSCRAMSHA512:
+		saslMechanism, err = scram.Mechanism(scram.SHA512, metadata.Username, metadata.Password)
+		if err != nil {
+			return nil, err
+		}
+	case KafkaSASLTypeOAuthbearer:
+		return nil, errors.New("SASL/OAUTHBEARER is not implemented yet")
+	case KafkaSASLTypeMskIam:
+		cfg, err := awsutils.GetAwsConfig(ctx, metadata.AWSRegion, metadata.AWSAuthorization)
+		if err != nil {
+			return nil, err
+		}
+
+		saslMechanism = aws_msk_iam_v2.NewMechanism(*cfg)
+	default:
+		return nil, fmt.Errorf("err sasl type %q given", metadata.SASLType)
+	}
+
+	transport := &kafka.Transport{
+		TLS:  tlsConfig,
+		SASL: saslMechanism,
+	}
+	client := kafka.Client{
+		Addr:      kafka.TCP(metadata.BootstrapServers...),
+		Transport: transport,
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error creating kafka client: %w", err)
+	}
+
+	return &client, nil
+}
+
+// We need just one producer for all the kafka-streams scaler instance
+// there is no place for a common initialization for all scalers of one kind in Keda,
+// hence this Mutex.
+
+// TODO: no SASL code.
+func (w *kedaKafkaProducer) createProducer(bootstrapServers []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.producer != nil {
+		// antoher scale object initializer the share writer.
+		return
+	}
+	producer := kafka.Writer{
+		Addr:         kafka.TCP(bootstrapServers...),
+		Topic:        kedaKafaStreamsTopic,
+		BatchSize:    10,
+		RequiredAcks: kafka.RequireAll,
+	}
+	w.producer = &producer
+	return
+}
+
+// creates if necessary the compacted topic to store metrics. There is one small json per scale object needed,
+// only the most recent one. 1 partition is plenty.  Json blob upded only at scale up time
+// Called from New... returning an error will fail the SO, will go to Active=false
+func createProducerTopic(client *kafka.Client) (err error) {
+	config := []kafka.ConfigEntry{{
+		ConfigName:  "cleanup.policy",
+		ConfigValue: "compact",
+	}}
+	res, err := client.CreateTopics(context.Background(), &kafka.CreateTopicsRequest{
+		Topics: []kafka.TopicConfig{
+			{
+				Topic:             kedaKafaStreamsTopic,
+				NumPartitions:     1,
+				ReplicationFactor: 3,
+				ConfigEntries:     config,
+			},
+		},
+	})
+	// the  call can fail of it can fail for just one of the topics, although we are using only 1
+	if err != nil {
+		return err
+	}
+	for _, error := range res.Errors {
+		if error != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// The scaler now just use the metrics that cross threshold on upscale to down scale
+// save just that metric to kafka; trivial to add the other topics if they come necessary later.
+func (w *kedaKafkaProducer) publishConsumerGroupMetrics(groupName string, topicName string, tMetrics *kafkaTopicMetrics) error {
+	p := persistentTopicMetric{
+		TopicName:   topicName,
+		TopicMetric: *tMetrics,
+	}
+	msg, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*100))
+	defer cancel()
+	// safe to call from go routines.
+	err = w.producer.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(groupName),
+		Value: []byte(msg),
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Done at startup only.   Whenever those metrics are updated, they are stored in in-memory scale state and published
+// to the compacted topic.  Also, we need to read the compacted topic ONCE at Keda startup, there is no hook for that
+// so every scale object will call.
+func (p *kafkaStreamsPersistentMetrics) ReadCompactedTopic(bootstrapServers []string, logger logr.Logger) (err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	defer func() { p.initialized = true }()
+	if p.initialized {
+		return nil
+	}
+
+	logger.V(1).Info(fmt.Sprintf("Compacted Topic - Creating Reader for tpoic %s", kedaKafaStreamsTopic))
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     bootstrapServers,
+		Partition:   0,
+		StartOffset: kafka.FirstOffset,
+		Topic:       kedaKafaStreamsTopic,
+		MaxBytes:    10e6, // 10MB
+		MaxWait:     time.Millisecond * 100,
+	})
+
+	// Go being go...
+	foo := make(map[string]persistentTopicMetric)
+	p.savedMetrics = foo
+
+	// context for FetchMessage to return when there is nothing more to read on the compated topic.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*100))
+	defer cancel()
+	for {
+		topicMetric := persistentTopicMetric{}
+		m, err := reader.FetchMessage(ctx)
+		if err != nil {
+			logger.V(1).Info(fmt.Sprintf("Compacted Topic - FetchMessage() completed: %s", err.Error()))
+			break
+		}
+		logger.V(1).Info(fmt.Sprintf("Compacted Topic - message message read at topic/partition/offset/high WAtermark %v/%v/%v/%v: %s = %s\n",
+			m.Topic, m.Partition, m.Offset, m.HighWaterMark, string(m.Key), string(m.Value)))
+
+		if err := json.Unmarshal([]byte(m.Value), &topicMetric); err != nil {
+			fmt.Printf("Compacted Topic - message error unmarshaling JSON: %v\n", err)
+		}
+		// highest offset value will have the most recent key
+		p.savedMetrics[string(m.Key)] = topicMetric
+	}
+	if err := reader.Close(); err != nil {
+		return err
+	}
+	return nil
 }
 
 /*
