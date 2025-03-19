@@ -488,7 +488,6 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 // Scaler Interface -- GetMetricsAndActivity()
 func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	s.logger.V(1).Info("GetMetricsAndActivity")
-	var metricErr error = nil
 	metricVal, err := s.getMetricForHPA(ctx)
 	if err != nil {
 		// log the reason of the failed metric calculation, do not return the error to Keda.
@@ -496,14 +495,14 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 		re, ok := err.(*consumerGroupError)
 		if ok {
 			if re.PermanentError() {
-				metricErr = err
+				return []external_metrics.ExternalMetricValue{}, false, err
 			}
 		}
 	}
 
 	// on errors, getMetricForHPA returns metric = TARGET
 	metric := GenerateMetricInMili(metricName, metricVal)
-	return []external_metrics.ExternalMetricValue{metric}, true, metricErr
+	return []external_metrics.ExternalMetricValue{metric}, true, nil
 }
 
 // Scaler Interface -- GetMetricSpecForScaling()
@@ -805,7 +804,7 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 	scaleFactor = 1.0
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
 		// no baseline, let's scale down to unless we reached mimimum consumer group memebers
-		if s.groupMembersCount > s.metadata.minMembersScaleDownFloor {
+		if s.groupHosts > s.metadata.minMembersScaleDownFloor {
 			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScale))
 			s.underThreasholdCount++
 			scaleDownTargetMet = true
