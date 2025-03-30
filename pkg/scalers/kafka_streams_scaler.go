@@ -96,7 +96,7 @@ type kafkaStreamsScaler struct {
 	groupState                string                       // last poll consumer group state
 	groupMembersCount         int64                        // Number of members in the consumer group
 	previousGroupMembersCount int64                        // Number of members in the consumer group in previous poll
-	groupHosts                int64                        // Number of hpsts in the consumer group
+	groupHosts                int64                        // Number of hosts in the consumer group
 	lastScaleUpTopicName      string                       // Store the name of the last topic for which metrics caused a scale up
 	lastScaleUpMetrics        *kafkaTopicMetrics           // Store metrics of the last topic that casued scale up
 	pollingCount              int64                        // Times the getMetricsAndActivity() API was called by keda.
@@ -167,6 +167,8 @@ const (
 	defaultIgnoreTopicsMatching              = "-KSTREAM" // Coma separated list of strings, topics names containing this substring will not be used for scaling.
 	defaultResetOnHostCount                  = false      // with a short polling interval, we want to leave time for host count to stabilize, detrimental with long
 	defaultMinMembersScaleDownFloor          = 2          // Scale down will stop once the consumer group members is down to this value
+	defaultScalingPaused                     = false      // Set to true for calculating all metrics and emit the logs, but not scal
+
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
 )
@@ -193,7 +195,9 @@ type kafkaStreamsMetadata struct {
 	MinPartitionsWithLag              int64
 	IgnoreTopicsMatching              []string
 	ResetOnHostCount                  bool
-	minMembersScaleDownFloor          int64
+	MinMembersScaleDownFloor          int64
+	ScalingPaused                     bool
+
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
 	// SASL
@@ -412,9 +416,18 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 		if err != nil || min < 1 {
 			return nil, fmt.Errorf("minMembersScaleDownFloor must be a inteter greater or equal than 1")
 		}
-		meta.minMembersScaleDownFloor = min
+		meta.MinMembersScaleDownFloor = min
 	} else {
-		meta.minMembersScaleDownFloor = defaultMinMembersScaleDownFloor
+		meta.MinMembersScaleDownFloor = defaultMinMembersScaleDownFloor
+	}
+	if val, ok := config.TriggerMetadata["scalingPaused"]; ok {
+		paused, err := strconv.ParseBool(val)
+		if err != nil {
+			return nil, fmt.Errorf("scalingPaused must be \"true\" or \"false\"")
+		}
+		meta.ScalingPaused = paused
+	} else {
+		meta.ScalingPaused = defaultScalingPaused
 	}
 
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
@@ -490,7 +503,7 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 	s.logger.V(1).Info("GetMetricsAndActivity")
 	metricVal, err := s.getMetricForHPA(ctx)
 	if err != nil {
-		// log the reason of the failed metric calculation, do not return the error to Keda.
+		// log the reason of the failed metric calculation
 		s.logger.V(0).Info(fmt.Sprintf("HPA final, Metric = TARGET, no mesurement due to %s", err))
 		re, ok := err.(*consumerGroupError)
 		if ok {
@@ -500,7 +513,6 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 		}
 	}
 
-	// on errors, getMetricForHPA returns metric = TARGET
 	metric := GenerateMetricInMili(metricName, metricVal)
 	return []external_metrics.ExternalMetricValue{metric}, true, nil
 }
@@ -608,6 +620,8 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	met := s.topicMetrics[topicInfoForLog]
 	action := "Scaling: no"
 	switch {
+	case s.metadata.ScalingPaused == true:
+		action = "Scaling: DISABLED: "
 	case factor > 1.0:
 		action = "Scaling: up: "
 	case factor < 1.0:
@@ -619,6 +633,10 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 		s.logger.V(1).Info(fmt.Sprintf("Final Metric: last scale up topic: %s, write/s: %f", s.lastScaleUpTopicName, s.lastScaleUpMetrics.WriteRate*1000))
 	}
 
+	if s.metadata.ScalingPaused {
+		// return metric = TARGET in this mode.
+		factor = 1.0
+	}
 	return hpaMetric * factor, nil
 }
 
@@ -804,7 +822,7 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 	scaleFactor = 1.0
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
 		// no baseline, let's scale down to unless we reached mimimum consumer group memebers
-		if s.groupHosts > s.metadata.minMembersScaleDownFloor {
+		if s.groupHosts > s.metadata.MinMembersScaleDownFloor {
 			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScale))
 			s.underThreasholdCount++
 			scaleDownTargetMet = true
@@ -1008,7 +1026,21 @@ func (s *kafkaStreamsScaler) getTopicPartitions(ctx context.Context) (map[string
 			}
 		}
 	}
-	hostsCnt := int64(len(hostsInGroup))
+
+	// TODO need a better solution - hack
+	// host returned by describe consumer group is the worker node ip or name.  hostsCnt value we need is process or pod count, not worker node count.
+	// Scaler is not currently configured with the number of streaming theaads; this is more configuration that can get wrong.
+	// if no 2 pods of the same service are scheduled on the same worker node, groupMembersCnt / len(hostsInGroup) => number of streaming threads.
+	// eg, number of threads = 3, number of members = 120, number of hosts = 40, 120/40 = 3.0.
+	// But if lets say 2 pods get scheduled on the same worker node, we get:
+	// number of threads = 3, number of members = 120, number of hosts = 39, 120/39 = 3.076923
+	// The funny math will restore hostsCnt to 40 pods/process.   Obviously, this will break once we reach 5 hosts with 2 pods each, at
+	// which point we have
+	// number of members = 120, number of hosts = 30, number of threads = 4.0 and hostsCnt := 30
+	// this is only used to avoid the scaler to scale down after minMembersScaleDownFloor. if this is confiured the same value
+	// as hpa min replicas, it wont scale lower anyways.   this is just a cosmetric issue.
+	hostsCnt := int64(float64(groupMembersCnt) / math.Floor(float64(groupMembersCnt)/float64(len(hostsInGroup))))
+
 	topics := make([]string, 0)
 	for name := range topicsInGroup {
 		topics = append(topics, name)
