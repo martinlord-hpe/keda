@@ -101,6 +101,7 @@ type kafkaStreamsScaler struct {
 	lastScaleUpMetrics        *kafkaTopicMetrics           // Store metrics of the last topic that casued scale up
 	pollingCount              int64                        // Times the getMetricsAndActivity() API was called by keda.
 	pollingStableCount        int64                        // Times the getMetricsAndActivity() API was called by keda and a metric could be calculated
+	underWriteThresholdDownSc int64                        // Timetamp of when we first see write threshold coming too low,too fast. Used for the period to pause scale down
 }
 
 /*
@@ -151,23 +152,25 @@ const (
 const (
 	noPartitionOffset = int64(-1)
 	// default Values for trigger parameters
-	defaultLagRatio                          = 3.0        // no unit
-	defaultCommitInterval                    = 30000      // milliseconds, default commit interval in Java Kafka streaming library.
-	defaultMinPartitionWriteThrouput         = 0.5        // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
-	defaultMeasurementsForScale              = 3          // number of polling intervals where conditions for scale up/down are met before scaling action
-	defaultScaleDownFactor                   = 0.60       // How much write rates to topic have to come down from last scale up to initiate downscale,
-	defaultLimitToPartitionsWithLag          = true       // when true, average lagratio at the topic level ignoring partitions with no writes.
-	defaultAllowedTimeLagCatchUp             = 600        // if consumerGroup is estimated to catchup lag under that time in seconds, do not scale up
-	defaultWritesToReadTolerance             = 20         // Tolerance to decide if reads and writes are 'close' one another, in percentage
-	defaultWritesToReadRatioDampening        = 0.66       // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
-	defaultMinReadRateToUseForReplicasCount  = 10         // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
-	defaultHPAMetricFactorMinimumScaleFactor = 1.11       // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
-	defaultLimitScaleUp                      = groupLimit // Limit scaling if group Members would exceed partitions: "group" -> topic with max partitions, "topic" -> topic causing scaling up, "none"
-	defaultMinPartitionsWithLag              = 2          // Do not scale unless the lag is on at least that many parition.
-	defaultIgnoreTopicsMatching              = "-KSTREAM" // Coma separated list of strings, topics names containing this substring will not be used for scaling.
-	defaultResetOnHostCount                  = false      // with a short polling interval, we want to leave time for host count to stabilize, detrimental with long
-	defaultMinMembersScaleDownFloor          = 2          // Scale down will stop once the consumer group members is down to this value
-	defaultScalingPaused                     = false      // Set to true for calculating all metrics and emit the logs, but not scal
+	defaultLagRatio                          = 3.0          // no unit
+	defaultCommitInterval                    = 30000        // milliseconds, default commit interval in Java Kafka streaming library.
+	defaultMinPartitionWriteThrouput         = 0.5          // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
+	defaultMeasurementsForScale              = 3            // number of polling intervals where conditions for scale up/down are met before scaling action
+	defaultScaleDownFactor                   = 0.60         // How much write rates to topic have to come down from last scale up to initiate downscale,
+	defaultLimitToPartitionsWithLag          = true         // when true, average lagratio at the topic level ignoring partitions with no writes.
+	defaultAllowedTimeLagCatchUp             = 600          // if consumerGroup is estimated to catchup lag under that time in seconds, do not scale up
+	defaultWritesToReadTolerance             = 20           // Tolerance to decide if reads and writes are 'close' one another, in percentage
+	defaultWritesToReadRatioDampening        = 0.66         // when calculating an HPA metric using the writes to read ratio, use a damping factor to avoid replicas overshoot
+	defaultMinReadRateToUseForReplicasCount  = 10           // Do not use writes to consumer read ratio to estimate HPA metric if topic read rate is lower in msg/s
+	defaultHPAMetricFactorMinimumScaleFactor = 1.11         // Target * 1.11 is just above HPA globally-configurable tolerance, 0.1 by default.
+	defaultLimitScaleUp                      = groupLimit   // Limit scaling if group Members would exceed partitions: "group" -> topic with max partitions, "topic" -> topic causing scaling up, "none"
+	defaultMinPartitionsWithLag              = 2            // Do not scale unless the lag is on at least that many parition.
+	defaultIgnoreTopicsMatching              = "-KSTREAM"   // Coma separated list of strings, topics names containing this substring will not be used for scaling.
+	defaultResetOnHostCount                  = false        // with a short polling interval, we want to leave time for host count to stabilize, detrimental with long
+	defaultMinMembersScaleDownFloor          = 2            // Scale down will stop once the consumer group members is down to this value
+	defaultScalingPaused                     = false        // Set to true for calculating all metrics and emit the logs, but pause scaling
+	defaultMinWritesForScaleDown             = 20           // Pause scale down if Write throughput suddently falls un this value percentage (likely temporary)
+	defaultScalePauseTime                    = 60 * 60 * 18 // Time in seconds to pause scale down when  Write throughput suddently falls
 
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
@@ -197,6 +200,8 @@ type kafkaStreamsMetadata struct {
 	ResetOnHostCount                  bool
 	MinMembersScaleDownFloor          int64
 	ScalingPaused                     bool
+	MinWritesForScaleDown             int64
+	ScalePauseTime                    int64
 
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
@@ -429,7 +434,24 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.ScalingPaused = defaultScalingPaused
 	}
-
+	if val, ok := config.TriggerMetadata["minWritesForScaleDown"]; ok {
+		mw, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || mw < 0 || mw > 100 {
+			return nil, fmt.Errorf("minWritesForScaleDown must be a inteter percentage value between 0 and 100")
+		}
+		meta.MinWritesForScaleDown = mw
+	} else {
+		meta.MinWritesForScaleDown = defaultMinWritesForScaleDown
+	}
+	if val, ok := config.TriggerMetadata["scalePauseTime"]; ok {
+		val, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || val < 0 {
+			return nil, fmt.Errorf("scalePauseTime must be a inteter value in seconds greater than 0")
+		}
+		meta.ScalePauseTime = val
+	} else {
+		meta.ScalePauseTime = defaultScalePauseTime
+	}
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
 	meta.SASLType = KafkaSASLTypeNone
 
@@ -820,6 +842,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 
 func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float64, scaleDownTargetMet bool, err error) {
 	scaleFactor = 1.0
+	writes := 0.0
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
 		// no baseline, let's scale down to unless we reached mimimum consumer group memebers
 		if s.groupHosts > s.metadata.MinMembersScaleDownFloor {
@@ -834,35 +857,53 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 			// ot supposed to happen, right behaviour?
 			return scaleFactor, false, fmt.Errorf("unexpected scaler state, topic missing metrics: %s", s.lastScaleUpTopicName)
 		}
-		// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and
-		// and write throughput is down by configured factor.
+		writes = tmetrics.WriteRate
 		if tmetrics.ReadRate > 0.0 && tmetrics.WriteRate > 0.0 && tmetrics.WriteRate < s.lastScaleUpMetrics.WriteRate*s.metadata.ScaleDownFactor {
-			switch {
-			// reads and writes are close, go ahead with scale down
-			case withinPercentage(tmetrics.WriteRate, tmetrics.ReadRate, float64(s.metadata.WritesToReadTolerance)):
-				s.underThreasholdCount++
-				scaleDownTargetMet = true
+			// Basic scale down decision, there is read and write activity on the topic that last caused the scale up and
+			// and write throughput is down by configured factor.
+			s.underThreasholdCount++
+			scaleDownTargetMet = true
+			if withinPercentage(tmetrics.WriteRate, tmetrics.ReadRate, float64(s.metadata.WritesToReadTolerance)) {
+				// reads and writes are close, go ahead with scale down - may implement different behavior in the future.
 				s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
 					tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
-			default:
-				s.underThreasholdCount++
-				scaleDownTargetMet = true
+			} else {
 				s.logger.V(0).Info(fmt.Sprintf("Scale down condition met (read/s and write/s not close), current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%%, scaleDownFactor: %f",
 					tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.metadata.ScaleDownFactor))
 			}
 		} else {
+			s.underWriteThresholdDownSc = 0
 			s.underThreasholdCount = 0
-			s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%% on topic %s, scaleDownFatcor: %f",
-				tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName, s.metadata.ScaleDownFactor))
+			s.logger.V(0).Info(fmt.Sprintf("Scale down condition not met, current writes/s %.3f, read/s %.3f, registered peak writes/s %.3f, r/w tolerance: %d%% on topic %s, scaleDownFatcor: %f, minWritesForScaleDown:%d%%",
+				tmetrics.WriteRate*1000, tmetrics.ReadRate*1000, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.WritesToReadTolerance, s.lastScaleUpTopicName, s.metadata.ScaleDownFactor, s.metadata.MinWritesForScaleDown))
 		}
 	}
 
 	if s.underThreasholdCount >= s.metadata.MeasurementsForScale {
-		s.resetScalingMeasurementsCount()
-		// HPA metric: desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
-		// with the above algo in HPA, if we want to down scale from up to 3 to 2, the metricc must be that low.
-		// using HPA policies in the SOPto soften
-		scaleFactor = 0.5
+		if writes > 0 && writes < s.lastScaleUpMetrics.WriteRate*float64(s.metadata.MinWritesForScaleDown)/100.0 {
+			// Write rates fell too low too fast, engage down scaling pause
+			// In initial deployment, with no recored writes, writes will be 0.
+			now := time.Now().UnixNano() / int64(time.Millisecond)
+			if s.underWriteThresholdDownSc == 0 {
+				s.underWriteThresholdDownSc = now
+			} else {
+				if now-s.underWriteThresholdDownSc < s.metadata.ScalePauseTime {
+					// pause period is over
+					s.underWriteThresholdDownSc = 0
+					scaleFactor = 0.5
+				} else {
+					s.logger.V(0).Info(fmt.Sprintf("Scale down condition was met but writes under minimum threshold (temporary condition?) current writes/s %.3f,registered peak writes/s %.3f, minWritesForScaleDown:%d%%",
+						writes, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.MinWritesForScaleDown))
+				}
+			}
+		} else {
+			s.underWriteThresholdDownSc = 0
+			s.resetScalingMeasurementsCount()
+			// HPA metric: desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
+			// with the above algo in HPA, if we want to down scale from up to 3 to 2, the metricc must be that low.
+			// using HPA policies in the SOPto soften
+			scaleFactor = 0.5
+		}
 	}
 
 	return scaleFactor, scaleDownTargetMet, nil
