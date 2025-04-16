@@ -883,11 +883,14 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 		if writes > 0 && writes < s.lastScaleUpMetrics.WriteRate*float64(s.metadata.MinWritesForScaleDown)/100.0 {
 			// Write rates fell too low too fast, engage down scaling pause
 			// In initial deployment, with no recored writes, writes will be 0.
-			now := time.Now().UnixNano() / int64(time.Millisecond)
+			now := time.Now().Unix() // In seconds
 			if s.underWriteThresholdDownSc == 0 {
 				s.underWriteThresholdDownSc = now
 			} else {
+				s.logger.V(0).Info(fmt.Sprintf("XXX DEBUG now:%d, s.underWriteThresholdDownSc: %d", now, s.underWriteThresholdDownSc))
 				if now-s.underWriteThresholdDownSc < s.metadata.ScalePauseTime {
+					s.logger.V(0).Info("Scale down condition was met, exceeded the pause period for low throughput, scaling down!")
+
 					// pause period is over
 					s.underWriteThresholdDownSc = 0
 					scaleFactor = 0.5
@@ -1370,7 +1373,7 @@ func (w *kedaKafkaProducer) createProducer(bootstrapServers []string) {
 	producer := kafka.Writer{
 		Addr:         kafka.TCP(bootstrapServers...),
 		Topic:        kedaKafaStreamsTopic,
-		BatchSize:    10,
+		BatchSize:    1,
 		RequiredAcks: kafka.RequireAll,
 	}
 	w.producer = &producer
@@ -1419,17 +1422,21 @@ func (w *kedaKafkaProducer) publishConsumerGroupMetrics(groupName string, topicN
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*100))
-	defer cancel()
-	// safe to call from go routines.
-	err = w.producer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(groupName),
-		Value: []byte(msg),
-	})
-	if err != nil {
-		return err
+	// this code depends on producer config.
+	for range 3 {
+		// 1 seconds timeout, 3 retries, important but not urgent
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*1500))
+		defer cancel()
+		// safe to call from go routines.
+		err = w.producer.WriteMessages(ctx, kafka.Message{
+			Key:   []byte(groupName),
+			Value: []byte(msg),
+		})
+		if err == nil {
+			break
+		}
 	}
-	return nil
+	return err
 }
 
 // Done at startup only.   Whenever those metrics are updated, they are stored in in-memory scale state and published
