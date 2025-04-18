@@ -596,6 +596,7 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	}
 
 	scaleDownTargetMet := false
+
 	if !scaleUpTargetMet {
 		factor, scaleDownTargetMet, err = s.getScaleDownDecisionAndFactor()
 		if err != nil {
@@ -831,11 +832,8 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 	}
 
 	// save metrics on compacted topic when we are really scaling up.
-	if scaleFactor != 1.0 {
-		err := kedaProducer.publishConsumerGroupMetrics(s.metadata.Group, topicName, &tmetrics)
-		if err != nil {
-			s.logger.V(0).Info(fmt.Sprintf("Compact pub: %s", err.Error()))
-		}
+	if scaleFactor > 1.0 && s.metadata.ScalingPaused == false {
+		kedaProducer.publishConsumerGroupMetrics(s, topicName, &tmetrics)
 	}
 	return scaleFactor, scaleUpTargetMet, nil
 }
@@ -1412,31 +1410,28 @@ func createProducerTopic(client *kafka.Client) (err error) {
 
 // The scaler now just use the metrics that cross threshold on upscale to down scale
 // save just that metric to kafka; trivial to add the other topics if they come necessary later.
-func (w *kedaKafkaProducer) publishConsumerGroupMetrics(groupName string, topicName string, tMetrics *kafkaTopicMetrics) error {
+func (w *kedaKafkaProducer) publishConsumerGroupMetrics(s *kafkaStreamsScaler, topicName string, tMetrics *kafkaTopicMetrics) {
+	groupName := s.metadata.Group
+
 	p := persistentTopicMetric{
 		TopicName:   topicName,
 		TopicMetric: *tMetrics,
 	}
 	msg, err := json.Marshal(p)
 	if err != nil {
-		return err
+		s.logger.V(0).Info("Compacted topic write error: unexpected marshalling error")
 	}
 
-	// this code depends on producer config.
-	for range 3 {
-		// 1 seconds timeout, 3 retries, important but not urgent
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*1500))
-		defer cancel()
-		// safe to call from go routines.
-		err = w.producer.WriteMessages(ctx, kafka.Message{
-			Key:   []byte(groupName),
-			Value: []byte(msg),
-		})
-		if err == nil {
-			break
-		}
+	// ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*1500))
+	// defer cancel()
+	ctx := context.Background()
+	err = w.producer.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(groupName),
+		Value: []byte(msg),
+	})
+	if err != nil {
+		s.logger.V(0).Info(fmt.Sprintf("Compacted topic write error: %s", err.Error()))
 	}
-	return err
 }
 
 // Done at startup only.   Whenever those metrics are updated, they are stored in in-memory scale state and published
