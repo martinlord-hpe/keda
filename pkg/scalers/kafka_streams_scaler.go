@@ -461,6 +461,7 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 
 // NewkafkaStreamScaler -- creates a new kafkaStreamScaler
 func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
+
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, err
@@ -470,6 +471,7 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		return nil, err
 	}
 	logger := InitializeLogger(config, "kafka_streams_scaler")
+	logger.V(0).Info("NewKafkaStreamScaler: Initializing scaler")
 
 	// kafka-go, each scaler has it's own client, producer is shared with all scalers.
 	client, err := getKafkaGoClient(ctx, *meta, logger)
@@ -629,7 +631,11 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 			}
 		}
 	case scaleDownTargetMet:
-		topicInfoForLog = s.lastScaleUpTopicName
+		if s.lastScaleUpTopicName != "Not Set" {
+			topicInfoForLog = s.lastScaleUpTopicName
+			break
+		}
+		fallthrough
 	default:
 		ratio := 0.0
 		for name, topicMetrics := range s.topicMetrics {
@@ -1342,8 +1348,9 @@ func getKafkaGoClient(ctx context.Context, metadata kafkaStreamsMetadata, logger
 	}
 
 	transport := &kafka.Transport{
-		TLS:  tlsConfig,
-		SASL: saslMechanism,
+		TLS:         tlsConfig,
+		SASL:        saslMechanism,
+		IdleTimeout: time.Second * 300,
 	}
 	client := kafka.Client{
 		Addr:      kafka.TCP(metadata.BootstrapServers...),
@@ -1422,7 +1429,7 @@ func (w *kedaKafkaProducer) publishConsumerGroupMetrics(s *kafkaStreamsScaler, t
 		s.logger.V(0).Info("Compacted topic write error: unexpected marshalling error")
 	}
 
-	// ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Millisecond*1500))
+	// ctx, cancel := context.WithTimeout(context.Background(), Duration(time.Millisecond*1500)time.)
 	// defer cancel()
 	ctx := context.Background()
 	err = w.producer.WriteMessages(ctx, kafka.Message{
