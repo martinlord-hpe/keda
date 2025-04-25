@@ -155,7 +155,9 @@ const (
 	defaultLagRatio                          = 3.0          // no unit
 	defaultCommitInterval                    = 30000        // milliseconds, default commit interval in Java Kafka streaming library.
 	defaultMinPartitionWriteThrouput         = 0.5          // in msg/secs.  lagRatio will not be calculated when throuhput is lower than this value
-	defaultMeasurementsForScale              = 3            // number of polling intervals where conditions for scale up/down are met before scaling action
+	defaultMeasurementsForScaleUp            = 3            // number of polling intervals where conditions for scale are met before scaling up
+	defaultMeasurementsForScaleDown          = 10           // number of polling intervals where conditions for scale are met before scaling down
+	defaultMeasurementsForScaleInitial       = 3            // number of polling intervals between scale downs at initial installation
 	defaultScaleDownFactor                   = 0.60         // How much write rates to topic have to come down from last scale up to initiate downscale,
 	defaultLimitToPartitionsWithLag          = true         // when true, average lagratio at the topic level ignoring partitions with no writes.
 	defaultAllowedTimeLagCatchUp             = 600          // if consumerGroup is estimated to catchup lag under that time in seconds, do not scale up
@@ -186,7 +188,9 @@ type kafkaStreamsMetadata struct {
 	LagRatio                          float64
 	CommitInterval                    int64
 	MinPartitionWriteThrouput         float64
-	MeasurementsForScale              int64
+	MeasurementsForScaleUp            int64
+	MeasurementsForScaleDown          int64
+	MeasurementsForScaleInitial       int64
 	ScaleDownFactor                   float64
 	LimitToPartitionsWithLag          bool
 	AllowedTimeLagCatchUp             int64
@@ -306,14 +310,32 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.MinPartitionWriteThrouput = defaultMinPartitionWriteThrouput
 	}
-	if val, ok := config.TriggerMetadata["measurementsForScale"]; ok {
+	if val, ok := config.TriggerMetadata["measurementsForScaleUp"]; ok {
 		measurements, err := strconv.ParseInt(val, 10, 64)
 		if err != nil || measurements <= 0 {
-			return nil, fmt.Errorf("measurementsForScale must be a inteter number greater than 0")
+			return nil, fmt.Errorf("measurementsForScaleUp must be a inteter number greater than 0")
 		}
-		meta.MeasurementsForScale = measurements
+		meta.MeasurementsForScaleUp = measurements
 	} else {
-		meta.MeasurementsForScale = defaultMeasurementsForScale
+		meta.MeasurementsForScaleUp = defaultMeasurementsForScaleUp
+	}
+	if val, ok := config.TriggerMetadata["measurementsForScaleDown"]; ok {
+		measurements, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || measurements <= 0 {
+			return nil, fmt.Errorf("measurementsForScaleDown must be a inteter number greater than 0")
+		}
+		meta.MeasurementsForScaleDown = measurements
+	} else {
+		meta.MeasurementsForScaleDown = defaultMeasurementsForScaleDown
+	}
+	if val, ok := config.TriggerMetadata["measurementsForScaleInitial"]; ok {
+		measurements, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || measurements <= 0 {
+			return nil, fmt.Errorf("measurementsForScaleInitial must be a inteter number greater than 0")
+		}
+		meta.MeasurementsForScaleInitial = measurements
+	} else {
+		meta.MeasurementsForScaleInitial = defaultMeasurementsForScaleInitial
 	}
 	if val, ok := config.TriggerMetadata["scaleDownFactor"]; ok {
 		scaleDown, err := strconv.ParseFloat(val, 64)
@@ -532,7 +554,9 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 		re, ok := err.(*consumerGroupError)
 		if ok {
 			if re.PermanentError() {
-				return []external_metrics.ExternalMetricValue{}, false, err
+				// returning error caused the scaler to be re-created, not good.
+				// log the error, dont return it to keda, and returning activity = False shows on the SO as Active = False.
+				return []external_metrics.ExternalMetricValue{}, false, nil
 			}
 		}
 	}
@@ -542,7 +566,7 @@ func (s *kafkaStreamsScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 }
 
 // Scaler Interface -- GetMetricSpecForScaling()
-// TODO.  Cosmetic issue.  Consider using a different TARGET ?  TARGET is set at lagRatio threshold, however although LagRatio is a key element for scaling up,
+// Cosmetic issue.  Consider using a different TARGET?  TARGET is set at lagRatio threshold, however although LagRatio is a key element for scaling up,
 // the final metric returned to HPA is NOT just measured LagRatio, it takes into account other internal metrics to emit a number that will
 // have 'desired' effect on replicas count based on over streaming consumer group state
 func (s *kafkaStreamsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
@@ -656,6 +680,7 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 	case factor < 1.0:
 		action = "Scaling: down: "
 	}
+
 	s.logger.V(0).Info(fmt.Sprintf("%s, Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, group: %s on topic: %s",
 		action, hpaMetric*factor, s.groupState, met.LagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.Lag, met.ResidualLag, met.WriteRate*1000, met.ReadRate*1000, s.writesRollingAvg[topicInfoForLog]*1000, s.metadata.Group, topicInfoForLog))
 	if s.lastScaleUpMetrics != nil {
@@ -683,7 +708,7 @@ func (s *kafkaStreamsScaler) resetScalingMeasurementsCount() {
 	s.underThreasholdCount = 0
 }
 
-// Update topics write/s rolling average over N periods, with N windown size = MeasurementsForScale
+// Update topics write/s rolling average over N periods, with N windown size = MeasurementsForScaleUp
 func (s *kafkaStreamsScaler) updateRollingAvg() {
 	// no rates on first iteration, down insert 0 in rolling average.
 	if s.pollingStableCount < 1 {
@@ -691,7 +716,7 @@ func (s *kafkaStreamsScaler) updateRollingAvg() {
 		return
 	}
 	// TODO: number of periods for rolling average should have its own knob?
-	cnt := math.Min(float64(s.pollingStableCount), float64(s.metadata.MeasurementsForScale))
+	cnt := math.Min(float64(s.pollingStableCount), float64(s.metadata.MeasurementsForScaleUp))
 	for name := range s.writesRollingAvg {
 		old_avg := s.writesRollingAvg[name]
 		// basic formula for calculating rolling average with just last avg and window size
@@ -765,7 +790,7 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 		}
 	}
 
-	if scaleUpCount >= s.metadata.MeasurementsForScale {
+	if scaleUpCount >= s.metadata.MeasurementsForScaleUp {
 		// calculate scaleFactor, the Metric multiplier
 		if topicName == "" {
 			return scaleFactor, scaleUpTargetMet, fmt.Errorf("unexpected error in scale up decision, no topic name")
@@ -847,12 +872,14 @@ func (s *kafkaStreamsScaler) getScaleUpDecisionAndFactor() (scaleFactor float64,
 func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float64, scaleDownTargetMet bool, err error) {
 	scaleFactor = 1.0
 	writes := 0.0
+	nIntervals := s.metadata.MeasurementsForScaleDown
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
 		// no baseline, let's scale down to unless we reached mimimum consumer group memebers
 		if s.groupHosts > s.metadata.MinMembersScaleDownFloor {
-			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScale))
+			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScaleDown))
 			s.underThreasholdCount++
 			scaleDownTargetMet = true
+			nIntervals = s.metadata.MeasurementsForScaleInitial
 		}
 	} else {
 		tmetrics, ok := s.topicMetrics[s.lastScaleUpTopicName]
@@ -883,7 +910,7 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 		}
 	}
 
-	if s.underThreasholdCount >= s.metadata.MeasurementsForScale {
+	if s.underThreasholdCount >= nIntervals {
 		if writes > 0 && writes < s.lastScaleUpMetrics.WriteRate*float64(s.metadata.MinWritesForScaleDown)/100.0 {
 			// Write rates fell too low too fast, engage down scaling pause
 			// In initial deployment, with no recored writes, writes will be 0.
@@ -891,16 +918,17 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 			if s.underWriteThresholdDownSc == 0 {
 				s.underWriteThresholdDownSc = now
 			} else {
-				s.logger.V(0).Info(fmt.Sprintf("XXX DEBUG now:%d, s.underWriteThresholdDownSc: %d", now, s.underWriteThresholdDownSc))
-				if now-s.underWriteThresholdDownSc < s.metadata.ScalePauseTime {
-					s.logger.V(0).Info("Scale down condition was met, exceeded the pause period for low throughput, scaling down!")
+				s.logger.V(2).Info(fmt.Sprintf("DEBUG now:%d, s.underWriteThresholdDownSc: %d", now, s.underWriteThresholdDownSc))
+				if now-s.underWriteThresholdDownSc > s.metadata.ScalePauseTime {
+					s.logger.V(0).Info("Scale down condition was met, exceeded the pause period forlow throughput, scaling down!")
 
 					// pause period is over
 					s.underWriteThresholdDownSc = 0
 					scaleFactor = 0.5
 				} else {
-					s.logger.V(0).Info(fmt.Sprintf("Scale down condition was met but writes under minimum threshold (temporary condition?) current writes/s %.3f,registered peak writes/s %.3f, minWritesForScaleDown:%d%%",
-						writes, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.MinWritesForScaleDown))
+					ftime := time.Unix(s.underWriteThresholdDownSc, 0)
+					s.logger.V(0).Info(fmt.Sprintf("Scale down condition was met but writes under minimum threshold (temporary condition?) current writes/s %.3f,registered peak writes/s %.3f, minWritesForScaleDown:%d%%, started at %s",
+						writes, s.lastScaleUpMetrics.WriteRate*1000, s.metadata.MinWritesForScaleDown, ftime.Format(time.RFC3339)))
 				}
 			}
 		} else {
@@ -975,8 +1003,14 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 	s.lastOffetsTime = now
 
 	// log the metrics aggregated for all the topics in the Consumer Group
+
 	for name, topicMetrics := range s.topicMetrics {
-		s.logger.V(0).Info(fmt.Sprintf("LagRatio: %.3f, lag: %d, residualLag: %d, partitions total/with lag: %d/%d, Write/s %.3f, Read/s %.3f, Group: %s, topic %s, interval(ms): %d", topicMetrics.LagRatio, topicMetrics.Lag, topicMetrics.ResidualLag, topicMetrics.PartitionsTotal, topicMetrics.PartitionsWithLag, topicMetrics.WriteRate*1000, topicMetrics.ReadRate*1000, s.metadata.Group, name, topicMetrics.Period))
+		above := ""
+		if topicMetrics.LagRatio > s.metadata.LagRatio {
+			above = " ABOVE THRESHOLD"
+		}
+		s.logger.V(0).Info(fmt.Sprintf("LagRatio: %.3f%s, Topic %s, Write/s %.3f, Read/s %.3f, Lag: %d, ResidualLag: %d, partitions total/with lag: %d/%d, Group: %s interval(ms): %d",
+			topicMetrics.LagRatio, above, name, topicMetrics.WriteRate*1000, topicMetrics.ReadRate*1000, topicMetrics.Lag, topicMetrics.ResidualLag, topicMetrics.PartitionsTotal, topicMetrics.PartitionsWithLag, s.metadata.Group, topicMetrics.Period))
 	}
 	return nil
 }
