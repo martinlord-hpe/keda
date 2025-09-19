@@ -887,7 +887,7 @@ func (s *kafkaStreamsScaler) getScaleDownDecisionAndFactor() (scaleFactor float6
 	if s.lastScaleUpTopicName == "" || s.lastScaleUpMetrics == nil {
 		// no baseline, let's scale down to unless we reached mimimum consumer group memebers
 		if s.groupHosts > s.metadata.MinMembersScaleDownFloor {
-			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScaleDown))
+			s.logger.V(0).Info(fmt.Sprintf("Downscaling check, Group %s has no saved metrics, will scale down after %d consecutive checks", s.metadata.Group, s.metadata.MeasurementsForScaleInitial))
 			s.underThreasholdCount++
 			scaleDownTargetMet = true
 			nIntervals = s.metadata.MeasurementsForScaleInitial
