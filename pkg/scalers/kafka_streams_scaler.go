@@ -173,6 +173,7 @@ const (
 	defaultScalingPaused                     = false        // Set to true for calculating all metrics and emit the logs, but pause scaling
 	defaultMinWritesForScaleDown             = 20           // Pause scale down if Write throughput suddently falls un this value percentage (likely temporary)
 	defaultScalePauseTime                    = 60 * 60 * 18 // Time in seconds to pause scale down when  Write throughput suddently falls
+	DefaultResetMeticsOnStartup              = false        // When true, scaler will not use saved metrics from compacted topic on startup
 
 	// Not configuratble (yet) default parameters for scaling decision.
 	scaleUpOnMultipleTopic = false // When true (not implemented!), scale on any combination of topic meeting threshold after MeasurementsForScale
@@ -206,6 +207,7 @@ type kafkaStreamsMetadata struct {
 	ScalingPaused                     bool
 	MinWritesForScaleDown             int64
 	ScalePauseTime                    int64
+	ResetMeticsOnStartup              bool
 
 	// Authenticaltion, copied from apache-kafka implementation
 	// TODO: Not implemented!
@@ -474,6 +476,15 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.ScalePauseTime = defaultScalePauseTime
 	}
+	if val, ok := config.TriggerMetadata["resetMeticsOnStartup"]; ok {
+		reset, err := strconv.ParseBool(val)
+		if err != nil {
+			return nil, fmt.Errorf("ResetMeticsOnStartup must be \"true\" or \"false\"")
+		}
+		meta.ResetMeticsOnStartup = reset
+	} else {
+		meta.ResetMeticsOnStartup = DefaultResetMeticsOnStartup
+	}
 	// TODO: parse Authentication (TLS, SASL,MSK).     Hardcoded to no SASL.
 	meta.SASLType = KafkaSASLTypeNone
 
@@ -512,7 +523,7 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 	m, ok := kafkaStreamsSavedMetrics.savedMetrics[meta.Group]
 	lst := "Not Set"
 	var lsm *kafkaTopicMetrics
-	if ok {
+	if ok && meta.ResetMeticsOnStartup == false {
 		logger.V(1).Info(fmt.Sprintf("Compacted Topic - Read Group:%s, topic: %s, write/ms: %f",
 			meta.Group, m.TopicName, m.TopicMetric.WriteRate))
 		lst = m.TopicName
@@ -1416,7 +1427,6 @@ func (w *kedaKafkaProducer) createProducer(bootstrapServers []string) {
 		RequiredAcks: kafka.RequireAll,
 	}
 	w.producer = &producer
-	return
 }
 
 // creates if necessary the compacted topic to store metrics. There is one small json per scale object needed,
