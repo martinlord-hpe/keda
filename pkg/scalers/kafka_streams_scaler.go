@@ -28,10 +28,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/asecurityteam/rolling"
 	"github.com/go-logr/logr"
 	awsutils "github.com/kedacore/keda/v2/pkg/scalers/aws"
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
+	"gonum.org/v1/gonum/stat"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
@@ -43,7 +45,6 @@ import (
 )
 
 /*
-
  To emit the single metric in getMetricsAndActiviy(), this scaler upses kafka metrics from the brokers.
  All those internal metrics rely on a time interval, for this reason and due to the 'lively'
  nature of kakfka consumer offsets metrics, thought the scaler will adapt to SO cofiguration, it will produce best results
@@ -58,6 +59,10 @@ spec:
   - type: kafka-streams
     metricType: Value
     useCachedMetrics: true
+
+Over time and with encountering different real life situations, the scaler has been made more and more complex to adapt
+and behave well in a variety of situations.  This scaler has exceeded the complexity level that can be reasonably
+used as an internal scaler in KEDA.  This code is waiting to be migrated to an external scaler
 */
 
 // Kafka metrics evaluated for each topic partition in the consumer group
@@ -79,29 +84,32 @@ type kafkaTopicMetrics struct {
 	PartitionsTotal   int64   // # total partitions in the topic
 }
 
-// and metrics State for EACH Scale Object
+// metrics and state for each Scale Object
 type kafkaStreamsScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *kafkaStreamsMetadata // scaler config from coarse validation of user input + default values
 	client     *kafka.Client         // kafka-go client
 	logger     logr.Logger
 	// Scaler state
-	previousConsumerOffsets   map[string]map[int]int64     // committed offsets for all the topics and topic parttions in last poll
-	previousLastOffsets       map[string]map[int]int64     // last offsets for all the topics and topic parttions in last poll
-	lastOffetsTime            int64                        // timestamp where all those offsets were updated
-	topicMetrics              map[string]kafkaTopicMetrics // Calculated metrics for each topic used for scaling decisions
-	writesRollingAvg          map[string]float64           // Approximate write/s rolling avg
-	aboveThresholdCount       map[string]int64             // Consecutive polling periods where lagRatio is met for 'MeasurementsForScale' for scale up
-	underThreasholdCount      int64                        // Consecutive polling periods where lagRatio is met for 'MeasurementsForScale' for scale down
-	groupState                string                       // last poll consumer group state
-	groupMembersCount         int64                        // Number of members in the consumer group
-	previousGroupMembersCount int64                        // Number of members in the consumer group in previous poll
-	groupHosts                int64                        // Number of hosts in the consumer group
-	lastScaleUpTopicName      string                       // Store the name of the last topic for which metrics caused a scale up
-	lastScaleUpMetrics        *kafkaTopicMetrics           // Store metrics of the last topic that casued scale up
-	pollingCount              int64                        // Times the getMetricsAndActivity() API was called by keda.
-	pollingStableCount        int64                        // Times the getMetricsAndActivity() API was called by keda and a metric could be calculated
-	underWriteThresholdDownSc int64                        // Timetamp of when we first see write threshold coming too low,too fast. Used for the period to pause scale down
+	// 'previous' values are from last polling interval
+	previousConsumerOffsets   map[string]map[int]int64        // committed offsets for all the topics and topic parttions in last poll
+	previousLastOffsets       map[string]map[int]int64        // last offsets for all the topics and topic parttions in last poll
+	lastOffetsTime            int64                           // timestamp where all those offsets were updated
+	topicMetrics              map[string]kafkaTopicMetrics    // Calculated metrics for each topic used for scaling decisions
+	writesAggWindow           map[string]*rolling.PointPolicy // rolling window of write/s for each topic
+	writesRollingAvg          map[string]float64              // Approximate write/s rolling avg
+	writesRollingStdDev       map[string]float64              // Approximate write/s rolling standard deviation
+	aboveThresholdCount       map[string]int64                // Consecutive polling periods where lagRatio is met for 'MeasurementsForScale' for scale up
+	underThreasholdCount      int64                           // Consecutive polling periods where lagRatio is met for 'MeasurementsForScale' for scale down
+	groupState                string                          // last poll consumer group state
+	groupMembersCount         int64                           // Number of members in the consumer group
+	previousGroupMembersCount int64                           // Number of members in the consumer group in previous poll
+	groupHosts                int64                           // Number of hosts in the consumer group
+	lastScaleUpTopicName      string                          // Store the name of the last topic for which metrics caused a scale up
+	lastScaleUpMetrics        *kafkaTopicMetrics              // Store metrics of the last topic that casued scale up
+	pollingCount              int64                           // Times the getMetricsAndActivity() API was called by keda.
+	pollingStableCount        int64                           // Times the getMetricsAndActivity() API was called by keda and a metric could be calculated
+	underWriteThresholdDownSc int64                           // Timetamp of when we first see write threshold coming too low,too fast. Used for the period to pause scale down
 }
 
 /*
@@ -121,7 +129,7 @@ type kafkaStreamsScaler struct {
           selectPolicy: Max
           policies:
             - type: Percent
-              value: 100
+              value: 10
               periodSeconds: 60
             - type: Pods
               value: 1
@@ -134,10 +142,10 @@ type kafkaStreamsScaler struct {
               value: 1
               periodSeconds: 60
             - type: Percent
-              value: 20
+              value: 10
               periodSeconds: 60
 
-
+Or make downscaleing more conservative by removingthe Pecent policy from scale down.
 */
 
 // see defaultLimitScaleUp
@@ -158,6 +166,7 @@ const (
 	defaultMeasurementsForScaleUp            = 3            // number of polling intervals where conditions for scale are met before scaling up
 	defaultMeasurementsForScaleDown          = 10           // number of polling intervals where conditions for scale are met before scaling down
 	defaultMeasurementsForScaleInitial       = 3            // number of polling intervals between scale downs at initial installation
+	defaultRollingMeasurements               = 15           // number of polling intervals for rolling average of writes/s and also for stddev calculation
 	defaultScaleDownFactor                   = 0.60         // How much write rates to topic have to come down from last scale up to initiate downscale,
 	defaultLimitToPartitionsWithLag          = true         // when true, average lagratio at the topic level ignoring partitions with no writes.
 	defaultAllowedTimeLagCatchUp             = 600          // if consumerGroup is estimated to catchup lag under that time in seconds, do not scale up
@@ -192,6 +201,7 @@ type kafkaStreamsMetadata struct {
 	MeasurementsForScaleUp            int64
 	MeasurementsForScaleDown          int64
 	MeasurementsForScaleInitial       int64
+	RollingMeasurements               int64
 	ScaleDownFactor                   float64
 	LimitToPartitionsWithLag          bool
 	AllowedTimeLagCatchUp             int64
@@ -348,6 +358,15 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	} else {
 		meta.ScaleDownFactor = defaultScaleDownFactor
 	}
+	if val, ok := config.TriggerMetadata["rollingMeasurements"]; ok {
+		window, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || window < 3 || window > 60 {
+			return nil, fmt.Errorf("rollingMeasurements must be a int number between 0 and 60")
+		}
+		meta.RollingMeasurements = window
+	} else {
+		meta.RollingMeasurements = defaultRollingMeasurements
+	}
 	if val, ok := config.TriggerMetadata["limitToPartitionsWithLag"]; ok {
 		lagOnly, err := strconv.ParseBool(val)
 		if err != nil {
@@ -494,7 +513,6 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 
 // NewkafkaStreamScaler -- creates a new kafkaStreamScaler
 func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
-
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, err
@@ -537,7 +555,9 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 	previousConsumerOffsets := make(map[string]map[int]int64)
 	previousLastOffsets := make(map[string]map[int]int64)
 	topicMetrics := make(map[string]kafkaTopicMetrics)
+	writesAggWindow := make(map[string]*rolling.PointPolicy)
 	writesRollingAvg := make(map[string]float64)
+	writesRollingStdDev := make(map[string]float64)
 	aboveThresholdCount := make(map[string]int64)
 
 	return &kafkaStreamsScaler{
@@ -548,7 +568,9 @@ func NewKafkaStreamScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		previousConsumerOffsets: previousConsumerOffsets,
 		previousLastOffsets:     previousLastOffsets,
 		topicMetrics:            topicMetrics,
+		writesAggWindow:         writesAggWindow,
 		writesRollingAvg:        writesRollingAvg,
+		writesRollingStdDev:     writesRollingStdDev,
 		aboveThresholdCount:     aboveThresholdCount,
 		lastScaleUpTopicName:    lst,
 		lastScaleUpMetrics:      lsm,
@@ -692,8 +714,9 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 		action = "Scaling: down: "
 	}
 
-	s.logger.V(0).Info(fmt.Sprintf("%s, Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, group: %s on topic: %s",
-		action, hpaMetric*factor, s.groupState, met.LagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.Lag, met.ResidualLag, met.WriteRate*1000, met.ReadRate*1000, s.writesRollingAvg[topicInfoForLog]*1000, s.metadata.Group, topicInfoForLog))
+	s.logger.V(0).Info(fmt.Sprintf("%s, Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, write/s stdev: %.1f, CV: %.qf%%, group: %s on topic: %s",
+		action, hpaMetric*factor, s.groupState, met.LagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.Lag, met.ResidualLag, met.WriteRate*1000, met.ReadRate*1000, s.writesRollingAvg[topicInfoForLog]*1000,
+		s.writesRollingStdDev[topicInfoForLog]*1000, s.writesRollingStdDev[topicInfoForLog]/s.writesRollingAvg[topicInfoForLog]*100, s.metadata.Group, topicInfoForLog))
 	if s.lastScaleUpMetrics != nil {
 		s.logger.V(1).Info(fmt.Sprintf("Final Metric: last scale up topic: %s, write/s: %f", s.lastScaleUpTopicName, s.lastScaleUpMetrics.WriteRate*1000))
 	}
@@ -719,21 +742,23 @@ func (s *kafkaStreamsScaler) resetScalingMeasurementsCount() {
 	s.underThreasholdCount = 0
 }
 
-// Update topics write/s rolling average over N periods, with N windown size = MeasurementsForScaleUp
+// Update topics write/s metrics average over N periods, with N windown size = RollingMeasurements
 func (s *kafkaStreamsScaler) updateRollingAvg() {
-	// no rates on first iteration, down insert 0 in rolling average.
-	if s.pollingStableCount < 1 {
-		s.pollingStableCount++
-		return
+	if s.pollingStableCount >= s.metadata.RollingMeasurements {
+		for name := range s.writesRollingAvg {
+			s.writesRollingAvg[name] = s.writesAggWindow[name].Reduce(rolling.Avg)
+			s.writesRollingStdDev[name] = s.writesAggWindow[name].Reduce(func(w rolling.Window) float64 {
+				// Window is a [][]float64, not ideal for stddev calculation, flatten it first
+				var flatten []float64
+				for _, row := range w {
+					flatten = append(flatten, row...)
+				}
+				s.logger.V(2).Info(fmt.Sprintf("recorded rolling write/s values for toic:%s, %v", name, flatten))
+				return stat.StdDev(flatten, nil)
+			})
+			s.logger.V(2).Info(fmt.Sprintf("Rolling metrics for topics: %s, Polls:%d, Roll avg: %f, Roll StdDev: %f ", name, s.pollingStableCount, s.writesRollingAvg[name], s.writesRollingStdDev[name]))
+		}
 	}
-	// TODO: number of periods for rolling average should have its own knob?
-	cnt := math.Min(float64(s.pollingStableCount), float64(s.metadata.MeasurementsForScaleUp))
-	for name := range s.writesRollingAvg {
-		old_avg := s.writesRollingAvg[name]
-		// basic formula for calculating rolling average with just last avg and window size
-		s.writesRollingAvg[name] = (old_avg * (cnt - 1) / cnt) + (s.topicMetrics[name].WriteRate / float64(cnt))
-	}
-	s.logger.V(2).Info(fmt.Sprintf("Rolling: %v pool:%d ", s.writesRollingAvg, s.pollingStableCount))
 	s.pollingStableCount++
 }
 
@@ -1008,6 +1033,9 @@ func (s *kafkaStreamsScaler) getAllConsumerGroupMetrics(ctx context.Context) err
 		_, ok := s.writesRollingAvg[topic]
 		if !ok {
 			s.writesRollingAvg[topic] = 0
+			s.writesAggWindow[topic] = rolling.NewPointPolicy(rolling.NewWindow(int(s.metadata.RollingMeasurements)))
+		} else {
+			s.writesAggWindow[topic].Append(tmetrics.WriteRate)
 		}
 	}
 	// important, update the time we gathered partititon metrics for rates calculations

@@ -26,6 +26,7 @@ require (
 	github.com/Huawei/gophercloud v1.0.21
 	github.com/IBM/sarama v1.43.3
 	github.com/arangodb/go-driver v1.6.5
+	github.com/asecurityteam/rolling v2.0.4+incompatible
 	github.com/aws/aws-msk-iam-sasl-signer-go v1.0.0
 	github.com/aws/aws-sdk-go-v2 v1.32.7
 	github.com/aws/aws-sdk-go-v2/config v1.28.7
@@ -96,6 +97,7 @@ require (
 	go.uber.org/mock v0.5.0
 	golang.org/x/oauth2 v0.24.0
 	golang.org/x/sync v0.10.0
+	gonum.org/v1/gonum v0.16.0
 	google.golang.org/api v0.214.0
 	google.golang.org/grpc v1.69.2
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1
@@ -156,6 +158,8 @@ replace (
 
 	// https://github.com/advisories/GHSA-29wx-vh33-7x7r
 	github.com/golang-jwt/jwt/v4 => github.com/golang-jwt/jwt/v4 v4.5.1
+
+	github.com/segmentio/kafka-go => ../kafka-go
 
 	// we use an updated package to avoid other vulnerabilities on its deps (like github.com/dgrijalva/jwt-go)
 	github.com/spf13/viper => github.com/spf13/viper v1.19.0
@@ -355,7 +359,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.33.0
 	go.opentelemetry.io/otel/trace v1.33.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.4.0 // indirect
-	go.uber.org/atomic v1.11.0
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/automaxprocs v1.6.0
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
@@ -365,7 +369,7 @@ require (
 	golang.org/x/net v0.33.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/term v0.27.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/text v0.23.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
 	golang.org/x/tools v0.28.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect
