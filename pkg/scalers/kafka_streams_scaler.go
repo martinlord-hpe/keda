@@ -361,7 +361,7 @@ func parseKafkaStreamsMetadata(config *scalersconfig.ScalerConfig) (*kafkaStream
 	if val, ok := config.TriggerMetadata["rollingMeasurements"]; ok {
 		window, err := strconv.ParseInt(val, 10, 64)
 		if err != nil || window < 3 || window > 60 {
-			return nil, fmt.Errorf("rollingMeasurements must be a int number between 0 and 60")
+			return nil, fmt.Errorf("rollingMeasurements must be a int number between 3 and 60")
 		}
 		meta.RollingMeasurements = window
 	} else {
@@ -714,7 +714,7 @@ func (s *kafkaStreamsScaler) getMetricForHPA(ctx context.Context) (float64, erro
 		action = "Scaling: down: "
 	}
 
-	s.logger.V(0).Info(fmt.Sprintf("%s, Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, write/s stdev: %.1f, CV: %.qf%%, group: %s on topic: %s",
+	s.logger.V(0).Info(fmt.Sprintf("%s, Final Metric: %.3f, Group state:%s, lag ratio: %.3f, counts up/down: %d/%d, lag: %d, residual lag: %d, write/s: %.1f, read/s: %.1f, write/s rolling avg: %.1f, write/s stdev: %.1f, CV: %.1f%%, group: %s on topic: %s",
 		action, hpaMetric*factor, s.groupState, met.LagRatio, s.aboveThresholdCount[topicInfoForLog], s.underThreasholdCount, met.Lag, met.ResidualLag, met.WriteRate*1000, met.ReadRate*1000, s.writesRollingAvg[topicInfoForLog]*1000,
 		s.writesRollingStdDev[topicInfoForLog]*1000, s.writesRollingStdDev[topicInfoForLog]/s.writesRollingAvg[topicInfoForLog]*100, s.metadata.Group, topicInfoForLog))
 	if s.lastScaleUpMetrics != nil {
@@ -753,7 +753,7 @@ func (s *kafkaStreamsScaler) updateRollingAvg() {
 				for _, row := range w {
 					flatten = append(flatten, row...)
 				}
-				s.logger.V(2).Info(fmt.Sprintf("recorded rolling write/s values for toic:%s, %v", name, flatten))
+				s.logger.V(0).Info(fmt.Sprintf("Recorded rolling write/s values for toic: %s, %v", name, flatten))
 				return stat.StdDev(flatten, nil)
 			})
 			s.logger.V(2).Info(fmt.Sprintf("Rolling metrics for topics: %s, Polls:%d, Roll avg: %f, Roll StdDev: %f ", name, s.pollingStableCount, s.writesRollingAvg[name], s.writesRollingStdDev[name]))
